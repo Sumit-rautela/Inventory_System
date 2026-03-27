@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Inventory Login</title>
+  <link rel="stylesheet" href="/public/style.css" />
+</head>
+<body class="login-body">
+  <div class="auth-shell">
+    <div class="auth-card">
+      <h1>Inventory System</h1>
+      <p class="subtitle">Login to manage products, stock, and categories.</p>
+
+      <div class="auth-tabs">
+        <button id="showLoginBtn" class="tab-btn active" type="button">Login</button>
+        <button id="showRegisterBtn" class="tab-btn" type="button">Register</button>
+      </div>
+
+      <form id="loginForm" class="auth-form">
+        <label for="loginUsername">Username</label>
+        <input id="loginUsername" name="username" type="text" required minlength="3" />
+
+        <label for="loginPassword">Password</label>
+        <div class="password-wrap">
+          <input id="loginPassword" name="password" type="password" required minlength="6" />
+          <button type="button" class="password-toggle" data-target="loginPassword">Show</button>
+        </div>
+
+        <button type="submit" class="btn-primary">Login</button>
+      </form>
+
+      <form id="registerForm" class="auth-form hidden">
+        <label for="registerUsername">Username</label>
+        <input id="registerUsername" name="username" type="text" required minlength="3" />
+
+        <label for="registerPassword">Password</label>
+        <div class="password-wrap">
+          <input id="registerPassword" name="password" type="password" required minlength="6" />
+          <button type="button" class="password-toggle" data-target="registerPassword">Show</button>
+        </div>
+
+        <button type="submit" class="btn-primary">Create Account</button>
+      </form>
+
+      <p id="authMessage" class="message"></p>
+    </div>
+  </div>
+
+  <script src="/public/app.js"></script>
+</body>
+</html>

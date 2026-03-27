@@ -1,0 +1,21 @@
+{
+  "name": "inventory-system",
+  "version": "1.0.0",
+  "description": "Beginner-friendly Inventory Management System using Node.js, Express, MySQL, and vanilla JS",
+  "main": "app.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node app.js",
+    "dev": "nodemon app.js"
+  },
+  "dependencies": {
+    "bcrypt": "^6.0.0",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.2",
+    "express-session": "^1.18.1",
+    "mysql2": "^3.11.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.7"
+  }
+}
