@@ -1,516 +1,498 @@
-function showTextMessage(element, text, isError) {
-  if (!element) return;
-  element.textContent = text;
-  element.style.color = isError ? '#b42318' : '#067647';
+const express = require('express');
+const path = require('path');
+const session = require('express-session');
+const bcrypt = require('bcrypt');
+const mysql = require('mysql2/promise');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
+
+const app = express();
+
+const SESSION_SECRET = process.env.SESSION_SECRET;
+if (!SESSION_SECRET) {
+  throw new Error('SESSION_SECRET is required in .env');
 }
 
-function escapeHtml(value) {
-  return String(value ?? '')
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
-}
+const db = mysql.createPool({
+  host: process.env.DB_HOST || 'localhost',
+  user: process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD || '',
+  database: process.env.DB_NAME || 'inventory_db',
+  port: Number(process.env.DB_PORT || 3306),
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
+});
 
-function initPasswordToggles() {
-  const buttons = document.querySelectorAll('.password-toggle[data-target]');
-  buttons.forEach((button) => {
-    button.addEventListener('click', () => {
-      const targetId = button.getAttribute('data-target');
-      const input = document.getElementById(targetId);
-      if (!input) return;
+app.use(express.json());
 
-      const isHidden = input.type === 'password';
-      input.type = isHidden ? 'text' : 'password';
-      button.textContent = isHidden ? 'Hide' : 'Show';
-    });
-  });
-}
+app.use(
+  session({
+    secret: SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      sameSite: 'lax',
+      secure: process.env.NODE_ENV === 'production',
+      maxAge: 1000 * 60 * 60 * 4
+    }
+  })
+);
 
-function initLoginPage() {
-  const loginForm = document.getElementById('loginForm');
-  const registerForm = document.getElementById('registerForm');
-  const showLoginBtn = document.getElementById('showLoginBtn');
-  const showRegisterBtn = document.getElementById('showRegisterBtn');
-  const authMessage = document.getElementById('authMessage');
+app.use('/public', express.static(path.join(__dirname, 'public')));
 
-  if (!loginForm || !registerForm) return;
-  initPasswordToggles();
-
-  function showLogin() {
-    loginForm.classList.remove('hidden');
-    registerForm.classList.add('hidden');
-    showLoginBtn.classList.add('active');
-    showRegisterBtn.classList.remove('active');
-    authMessage.textContent = '';
-  }
-
-  function showRegister() {
-    registerForm.classList.remove('hidden');
-    loginForm.classList.add('hidden');
-    showRegisterBtn.classList.add('active');
-    showLoginBtn.classList.remove('active');
-    authMessage.textContent = '';
-  }
-
-  showLoginBtn.addEventListener('click', showLogin);
-  showRegisterBtn.addEventListener('click', showRegister);
-
-  loginForm.addEventListener('submit', async (e) => {
-    e.preventDefault();
-
-    const username = document.getElementById('loginUsername').value.trim();
-    const password = document.getElementById('loginPassword').value.trim();
-
-    if (username.length < 3 || password.length < 6) {
-      return showTextMessage(authMessage, 'Please enter a valid username and password.', true);
+function requireAuth(req, res, next) {
+  if (!req.session.user) {
+    if (
+      req.originalUrl.startsWith('/products') ||
+      req.originalUrl.startsWith('/categories') ||
+      req.originalUrl.startsWith('/dashboard')
+    ) {
+      return res.status(401).json({ message: 'Unauthorized. Please login.' });
     }
 
-    try {
-      const response = await fetch('/auth/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password })
-      });
+    return res.redirect('/login');
+  }
+  next();
+}
 
-      const data = await response.json();
-      if (!response.ok) {
-        return showTextMessage(authMessage, data.message || 'Login failed.', true);
+function toCSVValue(value) {
+  const safe = String(value ?? '').replace(/"/g, '""');
+  return `"${safe}"`;
+}
+
+function parseDateInput(value) {
+  if (value === undefined || value === null || value === '') {
+    return { isValid: true, value: null };
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return { isValid: false, value: null };
+  }
+
+  return { isValid: true, value: date.toISOString().slice(0, 10) };
+}
+
+async function getCategoryNameById(categoryId) {
+  const [rows] = await db.execute('SELECT name FROM categories WHERE id = ?', [categoryId]);
+  if (!rows.length) return null;
+  return rows[0].name;
+}
+
+async function ensureProductsExpiryColumn() {
+  try {
+    await db.execute('ALTER TABLE products ADD COLUMN expiry_date DATE NULL');
+  } catch (error) {
+    if (error.code !== 'ER_DUP_FIELDNAME') {
+      throw error;
+    }
+  }
+}
+
+// Pages
+app.get('/login', (req, res) => {
+  if (req.session.user) {
+    return res.redirect('/');
+  }
+  return res.sendFile(path.join(__dirname, 'views', 'login.html'));
+});
+
+app.get('/', requireAuth, (req, res) => {
+  return res.sendFile(path.join(__dirname, 'views', 'index.html'));
+});
+
+// Auth
+app.post('/auth/register', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+
+    if (!username || !password) {
+      return res.status(400).json({ message: 'Username and password are required.' });
+    }
+
+    if (password.length < 6) {
+      return res.status(400).json({ message: 'Password must be at least 6 characters.' });
+    }
+
+    const [existing] = await db.execute('SELECT id FROM users WHERE username = ?', [username]);
+    if (existing.length > 0) {
+      return res.status(409).json({ message: 'Username already exists.' });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const [result] = await db.execute('INSERT INTO users (username, password) VALUES (?, ?)', [
+      username,
+      hashedPassword
+    ]);
+
+    return res.status(201).json({ message: 'User created successfully.', userId: result.insertId });
+  } catch (error) {
+    return res.status(500).json({ message: 'Registration failed.' });
+  }
+});
+
+app.post('/auth/login', async (req, res) => {
+  try {
+    const { username, password } = req.body;
+
+    if (!username || !password) {
+      return res.status(400).json({ message: 'Username and password are required.' });
+    }
+
+    const [rows] = await db.execute('SELECT id, username, password FROM users WHERE username = ?', [username]);
+    if (rows.length === 0) {
+      return res.status(401).json({ message: 'Invalid credentials.' });
+    }
+
+    const user = rows[0];
+    const isValid = await bcrypt.compare(password, user.password);
+    if (!isValid) {
+      return res.status(401).json({ message: 'Invalid credentials.' });
+    }
+
+    req.session.user = { id: user.id, username: user.username };
+    return res.json({ message: 'Login successful.' });
+  } catch (error) {
+    return res.status(500).json({ message: 'Login failed.' });
+  }
+});
+
+app.post('/auth/logout', (req, res) => {
+  req.session.destroy((err) => {
+    if (err) {
+      return res.status(500).json({ message: 'Logout failed.' });
+    }
+    res.clearCookie('connect.sid');
+    return res.json({ message: 'Logout successful.' });
+  });
+});
+
+app.get('/auth/session', (req, res) => {
+  if (!req.session.user) {
+    return res.status(401).json({ authenticated: false });
+  }
+  return res.json({ authenticated: true, user: req.session.user });
+});
+
+// Categories
+app.get('/categories', requireAuth, async (req, res) => {
+  try {
+    const [rows] = await db.execute('SELECT id, name FROM categories ORDER BY name ASC');
+    return res.json(rows);
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to fetch categories.' });
+  }
+});
+
+app.post('/categories', requireAuth, async (req, res) => {
+  try {
+    const { name } = req.body;
+    if (!name) {
+      return res.status(400).json({ message: 'Category name is required.' });
+    }
+
+    const [result] = await db.execute('INSERT INTO categories (name) VALUES (?)', [name]);
+    return res.status(201).json({ message: 'Category added successfully.', categoryId: result.insertId });
+  } catch (error) {
+    if (error.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ message: 'Category already exists.' });
+    }
+    return res.status(500).json({ message: 'Failed to add category.' });
+  }
+});
+
+app.delete('/categories/:id', requireAuth, async (req, res) => {
+  try {
+    const parsedId = Number(req.params.id);
+    if (!Number.isInteger(parsedId) || parsedId <= 0) {
+      return res.status(400).json({ message: 'Invalid category id.' });
+    }
+
+    const [result] = await db.execute('DELETE FROM categories WHERE id = ?', [parsedId]);
+    if (!result.affectedRows) {
+      return res.status(404).json({ message: 'Category not found.' });
+    }
+    return res.json({ message: 'Category deleted successfully.' });
+  } catch (error) {
+    if (error.code === 'ER_ROW_IS_REFERENCED_2') {
+      return res.status(400).json({ message: 'Cannot delete category with existing products.' });
+    }
+    return res.status(500).json({ message: 'Failed to delete category.' });
+  }
+});
+
+// Products
+app.get('/products', requireAuth, async (req, res) => {
+  try {
+    const { search = '', categoryId = '' } = req.query;
+    const normalizedCategoryId = String(categoryId || '').trim().toLowerCase();
+    let sql = `
+      SELECT p.id, p.name, p.quantity, p.price, p.expiry_date, p.created_at, c.id AS category_id, c.name AS category_name
+      FROM products p
+      LEFT JOIN categories c ON p.category_id = c.id
+      WHERE 1 = 1
+    `;
+    const params = [];
+
+    if (search) {
+      sql += ' AND p.name LIKE ?';
+      params.push(`%${search}%`);
+    }
+
+    if (normalizedCategoryId && normalizedCategoryId !== 'all') {
+      const parsedCategoryId = Number(normalizedCategoryId);
+      if (!Number.isInteger(parsedCategoryId) || parsedCategoryId <= 0) {
+        return res.status(400).json({ message: 'Invalid category filter.' });
       }
 
-      window.location.href = '/';
-    } catch (error) {
-      showTextMessage(authMessage, 'Network error while logging in.', true);
-    }
-  });
-
-  registerForm.addEventListener('submit', async (e) => {
-    e.preventDefault();
-
-    const username = document.getElementById('registerUsername').value.trim();
-    const password = document.getElementById('registerPassword').value.trim();
-
-    if (username.length < 3 || password.length < 6) {
-      return showTextMessage(authMessage, 'Username must be 3+ chars and password 6+ chars.', true);
+      sql += ' AND p.category_id = ?';
+      params.push(parsedCategoryId);
     }
 
-    try {
-      const response = await fetch('/auth/register', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password })
-      });
+    sql += ' ORDER BY p.created_at DESC';
 
-      const data = await response.json();
-      if (!response.ok) {
-        return showTextMessage(authMessage, data.message || 'Registration failed.', true);
+    const [rows] = await db.execute(sql, params);
+    return res.json(rows);
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to fetch products.' });
+  }
+});
+
+app.post('/products', requireAuth, async (req, res) => {
+  try {
+    const { name, category_id, quantity, price, expiry_date } = req.body;
+    if (!name || !category_id || quantity === undefined || price === undefined) {
+      return res.status(400).json({ message: 'All fields are required.' });
+    }
+
+    const parsedCategoryId = Number(category_id);
+    const parsedQuantity = Number(quantity);
+    const parsedPrice = Number(price);
+    if (
+      !Number.isInteger(parsedCategoryId) ||
+      parsedCategoryId <= 0 ||
+      !Number.isFinite(parsedQuantity) ||
+      parsedQuantity < 0 ||
+      !Number.isFinite(parsedPrice) ||
+      parsedPrice < 0
+    ) {
+      return res.status(400).json({ message: 'Invalid product values.' });
+    }
+
+    const categoryName = await getCategoryNameById(parsedCategoryId);
+    if (!categoryName) {
+      return res.status(400).json({ message: 'Invalid category.' });
+    }
+
+    const parsedExpiryDate = parseDateInput(expiry_date);
+    if (!parsedExpiryDate.isValid) {
+      return res.status(400).json({ message: 'Invalid expiry date.' });
+    }
+
+    const isGroceries = categoryName.trim().toLowerCase() === 'groceries';
+    if (isGroceries && !parsedExpiryDate.value) {
+      return res.status(400).json({ message: 'Expiry date is required for groceries products.' });
+    }
+
+    const finalExpiryDate = isGroceries ? parsedExpiryDate.value : null;
+
+    const [result] = await db.execute(
+      'INSERT INTO products (name, category_id, quantity, price, expiry_date) VALUES (?, ?, ?, ?, ?)',
+      [name, parsedCategoryId, parsedQuantity, parsedPrice, finalExpiryDate]
+    );
+
+    return res.status(201).json({ message: 'Product added successfully.', productId: result.insertId });
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to add product.' });
+  }
+});
+
+app.put('/products/:id', requireAuth, async (req, res) => {
+  try {
+    const { name, category_id, quantity, price, expiry_date } = req.body;
+    if (!name || !category_id || quantity === undefined || price === undefined) {
+      return res.status(400).json({ message: 'All fields are required.' });
+    }
+
+    const parsedCategoryId = Number(category_id);
+    const parsedQuantity = Number(quantity);
+    const parsedPrice = Number(price);
+    const parsedId = Number(req.params.id);
+    if (
+      !Number.isInteger(parsedCategoryId) ||
+      parsedCategoryId <= 0 ||
+      !Number.isFinite(parsedQuantity) ||
+      parsedQuantity < 0 ||
+      !Number.isFinite(parsedPrice) ||
+      parsedPrice < 0 ||
+      !Number.isInteger(parsedId) ||
+      parsedId <= 0
+    ) {
+      return res.status(400).json({ message: 'Invalid product values.' });
+    }
+
+    const categoryName = await getCategoryNameById(parsedCategoryId);
+    if (!categoryName) {
+      return res.status(400).json({ message: 'Invalid category.' });
+    }
+
+    const parsedExpiryDate = parseDateInput(expiry_date);
+    if (!parsedExpiryDate.isValid) {
+      return res.status(400).json({ message: 'Invalid expiry date.' });
+    }
+
+    const isGroceries = categoryName.trim().toLowerCase() === 'groceries';
+    if (isGroceries && !parsedExpiryDate.value) {
+      return res.status(400).json({ message: 'Expiry date is required for groceries products.' });
+    }
+
+    const finalExpiryDate = isGroceries ? parsedExpiryDate.value : null;
+
+    const [result] = await db.execute(
+      'UPDATE products SET name = ?, category_id = ?, quantity = ?, price = ?, expiry_date = ? WHERE id = ?',
+      [name, parsedCategoryId, parsedQuantity, parsedPrice, finalExpiryDate, parsedId]
+    );
+
+    if (!result.affectedRows) {
+      return res.status(404).json({ message: 'Product not found.' });
+    }
+
+    return res.json({ message: 'Product updated successfully.' });
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to update product.' });
+  }
+});
+
+app.delete('/products/:id', requireAuth, async (req, res) => {
+  try {
+    const parsedId = Number(req.params.id);
+    if (!Number.isInteger(parsedId) || parsedId <= 0) {
+      return res.status(400).json({ message: 'Invalid product id.' });
+    }
+
+    const [result] = await db.execute('DELETE FROM products WHERE id = ?', [parsedId]);
+    if (!result.affectedRows) {
+      return res.status(404).json({ message: 'Product not found.' });
+    }
+    return res.json({ message: 'Product deleted successfully.' });
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to delete product.' });
+  }
+});
+
+app.get('/products/export/csv', requireAuth, async (req, res) => {
+  try {
+    const { search = '', categoryId = '' } = req.query;
+    const normalizedCategoryId = String(categoryId || '').trim().toLowerCase();
+    let sql = `
+      SELECT p.id, p.name, p.quantity, p.price, p.expiry_date, p.created_at, c.name AS category_name
+      FROM products p
+      LEFT JOIN categories c ON p.category_id = c.id
+      WHERE 1 = 1
+    `;
+    const params = [];
+
+    if (search) {
+      sql += ' AND p.name LIKE ?';
+      params.push(`%${search}%`);
+    }
+
+    if (normalizedCategoryId && normalizedCategoryId !== 'all') {
+      const parsedCategoryId = Number(normalizedCategoryId);
+      if (!Number.isInteger(parsedCategoryId) || parsedCategoryId <= 0) {
+        return res.status(400).json({ message: 'Invalid category filter.' });
       }
 
-      showTextMessage(authMessage, 'Registration successful. Please login now.', false);
-      registerForm.reset();
-      showLogin();
-    } catch (error) {
-      showTextMessage(authMessage, 'Network error while registering.', true);
+      sql += ' AND p.category_id = ?';
+      params.push(parsedCategoryId);
     }
-  });
-}
 
-function initDashboardPage() {
-  const sections = document.querySelectorAll('.panel');
-  const navButtons = document.querySelectorAll('.nav-btn[data-section]');
-  const globalMessage = document.getElementById('globalMessage');
-  const welcomeText = document.getElementById('welcomeText');
+    sql += ' ORDER BY p.created_at DESC';
 
-  const productForm = document.getElementById('productForm');
-  const productIdInput = document.getElementById('productId');
-  const productNameInput = document.getElementById('productName');
-  const productCategoryInput = document.getElementById('productCategory');
-  const productQuantityInput = document.getElementById('productQuantity');
-  const productPriceInput = document.getElementById('productPrice');
-  const productExpiryInput = document.getElementById('productExpiry');
-  const cancelEditBtn = document.getElementById('cancelEditBtn');
-  const saveProductBtn = document.getElementById('saveProductBtn');
+    const [rows] = await db.execute(sql, params);
+    const header = ['ID', 'Name', 'Category', 'Quantity', 'Price', 'Expiry Date', 'Created At'];
+    const dataRows = rows.map((row) => [
+      row.id,
+      row.name,
+      row.category_name || '',
+      row.quantity,
+      row.price,
+      row.expiry_date ? new Date(row.expiry_date).toISOString().slice(0, 10) : '',
+      new Date(row.created_at).toISOString()
+    ]);
+    const csv = [header, ...dataRows].map((row) => row.map(toCSVValue).join(',')).join('\n');
 
-  const searchInput = document.getElementById('searchInput');
-  const categoryFilter = document.getElementById('categoryFilter');
-  const exportCsvBtn = document.getElementById('exportCsvBtn');
-
-  const categoryForm = document.getElementById('categoryForm');
-  const categoryNameInput = document.getElementById('categoryName');
-
-  const productsBody = document.getElementById('productsBody');
-  const categoriesBody = document.getElementById('categoriesBody');
-  const lowStockProductsBody = document.getElementById('lowStockProductsBody');
-  const expiringProductsBody = document.getElementById('expiringProductsBody');
-  const recentProductsBody = document.getElementById('recentProductsBody');
-
-  const totalProductsEl = document.getElementById('totalProducts');
-  const inventoryValueEl = document.getElementById('inventoryValue');
-
-  const logoutBtn = document.getElementById('logoutBtn');
-
-  if (!productForm || !logoutBtn) return;
-
-  let currentSearch = '';
-  let currentCategoryFilter = '';
-  let categoriesCache = [];
-
-  function showMessage(text, isError) {
-    showTextMessage(globalMessage, text, !!isError);
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', 'attachment; filename="products.csv"');
+    return res.send(csv);
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to export CSV.' });
   }
+});
 
-  function switchSection(sectionId) {
-    sections.forEach((section) => {
-      section.classList.toggle('visible', section.id === sectionId);
+// Dashboard
+app.get('/dashboard', requireAuth, async (req, res) => {
+  try {
+    const [totalRows] = await db.execute('SELECT COUNT(*) AS total FROM products');
+    const [lowStockRows] = await db.execute(
+      `SELECT p.id, p.name, p.quantity, p.price, p.expiry_date, c.name AS category_name
+       FROM products p
+       LEFT JOIN categories c ON p.category_id = c.id
+       WHERE p.quantity < 10
+       ORDER BY p.quantity ASC`
+    );
+    const [recentRows] = await db.execute(
+      `SELECT p.id, p.name, p.quantity, p.price, p.expiry_date, p.created_at, c.name AS category_name
+       FROM products p
+       LEFT JOIN categories c ON p.category_id = c.id
+       ORDER BY p.created_at DESC
+       LIMIT 5`
+    );
+    const [expiringRows] = await db.execute(
+      `SELECT p.id, p.name, p.quantity, p.price, p.expiry_date, c.name AS category_name
+       FROM products p
+       LEFT JOIN categories c ON p.category_id = c.id
+       WHERE p.expiry_date IS NOT NULL
+         AND DATEDIFF(p.expiry_date, CURDATE()) BETWEEN 0 AND 7
+       ORDER BY p.expiry_date ASC`
+    );
+    const [valueRows] = await db.execute('SELECT IFNULL(SUM(quantity * price), 0) AS totalValue FROM products');
+
+    return res.json({
+      totalProducts: totalRows[0].total,
+      lowStockItems: lowStockRows,
+      expiringProducts: expiringRows,
+      recentProducts: recentRows,
+      totalInventoryValue: Number(valueRows[0].totalValue || 0)
     });
-    navButtons.forEach((btn) => {
-      btn.classList.toggle('active', btn.dataset.section === sectionId);
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to load dashboard data.' });
+  }
+});
+
+app.use((req, res) => {
+  return res.status(404).json({ message: 'Route not found.' });
+});
+
+app.use((error, req, res, next) => {
+  console.error(error);
+
+  if (error.type === 'entity.parse.failed') {
+    return res.status(400).json({ message: 'Invalid JSON body.' });
+  }
+
+  return res.status(500).json({ message: 'Internal server error.' });
+});
+
+const PORT = Number(process.env.PORT || 3000);
+ensureProductsExpiryColumn()
+  .then(() => {
+    app.listen(PORT, () => {
+      console.log(`Server running at http://localhost:${PORT}`);
     });
-  }
-
-  function formatINR(value) {
-    return new Intl.NumberFormat('en-IN', {
-      style: 'currency',
-      currency: 'INR'
-    }).format(value);
-  }
-
-  function isGroceriesByCategoryId(categoryId) {
-    const category = categoriesCache.find((item) => String(item.id) === String(categoryId));
-    return !!category && category.name.trim().toLowerCase() === 'groceries';
-  }
-
-  function formatExpiryDate(expiryDate) {
-    if (!expiryDate) return '-';
-    const date = new Date(expiryDate);
-    if (Number.isNaN(date.getTime())) return '-';
-    return date.toLocaleDateString();
-  }
-
-  function isExpiryWarning(product) {
-    if (!product || String(product.category_name || '').trim().toLowerCase() !== 'groceries' || !product.expiry_date) {
-      return false;
-    }
-
-    const expiryDate = new Date(product.expiry_date);
-    if (Number.isNaN(expiryDate.getTime())) return false;
-
-    const today = new Date();
-    today.setHours(0, 0, 0, 0);
-    expiryDate.setHours(0, 0, 0, 0);
-
-    const diffDays = Math.ceil((expiryDate.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
-    return diffDays <= 7;
-  }
-
-  function renderExpiryCell(product) {
-    const formattedDate = formatExpiryDate(product.expiry_date);
-    if (formattedDate === '-') return '-';
-
-    if (isExpiryWarning(product)) {
-      return '<span class="expiry-warning">' + escapeHtml(formattedDate) + '</span>';
-    }
-
-    return escapeHtml(formattedDate);
-  }
-
-  async function checkSession() {
-    const response = await fetch('/auth/session');
-    if (!response.ok) {
-      window.location.href = '/login';
-      return;
-    }
-
-    const data = await response.json();
-    welcomeText.textContent = 'Logged in as: ' + data.user.username;
-  }
-
-  async function loadCategories() {
-    const response = await fetch('/categories');
-    if (!response.ok) throw new Error('Unable to load categories');
-
-    const categories = await response.json();
-    categoriesCache = categories;
-    productCategoryInput.innerHTML = '<option value="">Select Category</option>';
-    categoryFilter.innerHTML = '<option value="">All Categories</option>';
-    categoriesBody.innerHTML = '';
-
-    categories.forEach((category) => {
-      const option1 = document.createElement('option');
-      option1.value = category.id;
-      option1.textContent = category.name;
-      productCategoryInput.appendChild(option1);
-
-      const option2 = document.createElement('option');
-      option2.value = category.id;
-      option2.textContent = category.name;
-      categoryFilter.appendChild(option2);
-
-      const row = document.createElement('tr');
-      row.innerHTML =
-        '<td>' + escapeHtml(category.name) + '</td>' +
-        '<td><button class="btn-danger" data-delete-category="' + category.id + '">Delete</button></td>';
-      categoriesBody.appendChild(row);
-    });
-  }
-
-  async function loadProducts() {
-    const query = new URLSearchParams();
-    if (currentSearch) {
-      query.set('search', currentSearch);
-    }
-    if (currentCategoryFilter) {
-      query.set('categoryId', currentCategoryFilter);
-    }
-
-    const response = await fetch('/products?' + query.toString());
-    if (!response.ok) throw new Error('Unable to load products');
-
-    const products = await response.json();
-    productsBody.innerHTML = '';
-
-    products.forEach((product) => {
-      const row = document.createElement('tr');
-      if (product.quantity < 10) row.classList.add('low-stock-row');
-
-      row.innerHTML =
-        '<td>' + escapeHtml(product.name) + '</td>' +
-        '<td>' + escapeHtml(product.category_name || '-') + '</td>' +
-        '<td>' + product.quantity + '</td>' +
-        '<td>' + formatINR(product.price) + '</td>' +
-        '<td>' + renderExpiryCell(product) + '</td>' +
-        '<td>' +
-        '<button class="btn-secondary" data-edit-product="' + encodeURIComponent(JSON.stringify(product)) + '">Edit</button> ' +
-        '<button class="btn-danger" data-delete-product="' + product.id + '">Delete</button>' +
-        '</td>';
-      productsBody.appendChild(row);
-    });
-  }
-
-  async function loadDashboard() {
-    const response = await fetch('/dashboard');
-    if (!response.ok) throw new Error('Unable to load dashboard');
-
-    const data = await response.json();
-    totalProductsEl.textContent = data.totalProducts;
-    inventoryValueEl.textContent = formatINR(data.totalInventoryValue);
-
-    lowStockProductsBody.innerHTML = '';
-    data.lowStockItems.forEach((product) => {
-      const row = document.createElement('tr');
-      row.classList.add('low-stock-row');
-      row.innerHTML =
-        '<td>' + escapeHtml(product.name) + '</td>' +
-        '<td>' + escapeHtml(product.category_name || '-') + '</td>' +
-        '<td>' + product.quantity + '</td>' +
-        '<td>' + formatINR(product.price) + '</td>' +
-        '<td>' + renderExpiryCell(product) + '</td>';
-      lowStockProductsBody.appendChild(row);
-    });
-
-    expiringProductsBody.innerHTML = '';
-    data.expiringProducts.forEach((product) => {
-      const row = document.createElement('tr');
-      row.innerHTML =
-        '<td>' + escapeHtml(product.name) + '</td>' +
-        '<td>' + escapeHtml(product.category_name || '-') + '</td>' +
-        '<td>' + product.quantity + '</td>' +
-        '<td>' + formatINR(product.price) + '</td>' +
-        '<td>' + renderExpiryCell(product) + '</td>';
-      expiringProductsBody.appendChild(row);
-    });
-
-    recentProductsBody.innerHTML = '';
-    data.recentProducts.forEach((product) => {
-      const row = document.createElement('tr');
-      row.innerHTML =
-        '<td>' + escapeHtml(product.name) + '</td>' +
-        '<td>' + escapeHtml(product.category_name || '-') + '</td>' +
-        '<td>' + product.quantity + '</td>' +
-        '<td>' + formatINR(product.price) + '</td>' +
-        '<td>' + renderExpiryCell(product) + '</td>' +
-        '<td>' + new Date(product.created_at).toLocaleString() + '</td>';
-      recentProductsBody.appendChild(row);
-    });
-  }
-
-  function resetProductForm() {
-    productForm.reset();
-    productIdInput.value = '';
-    productExpiryInput.value = '';
-    saveProductBtn.textContent = 'Add Product';
-    cancelEditBtn.classList.add('hidden');
-  }
-
-  async function refreshAll() {
-    await loadCategories();
-    await loadProducts();
-    await loadDashboard();
-  }
-
-  navButtons.forEach((btn) => {
-    btn.addEventListener('click', () => switchSection(btn.dataset.section));
+  })
+  .catch((error) => {
+    console.error('Server startup failed:', error.message);
+    process.exit(1);
   });
-
-  productForm.addEventListener('submit', async (e) => {
-    e.preventDefault();
-
-    const payload = {
-      name: productNameInput.value.trim(),
-      category_id: productCategoryInput.value,
-      quantity: Number(productQuantityInput.value),
-      price: Number(productPriceInput.value),
-      expiry_date: productExpiryInput.value
-    };
-
-    if (!payload.name || !payload.category_id || payload.quantity < 0 || payload.price < 0) {
-      return showMessage('Please fill all product fields with valid values.', true);
-    }
-
-    if (isGroceriesByCategoryId(payload.category_id) && !payload.expiry_date) {
-      return showMessage('Expiry date is required for groceries products.', true);
-    }
-
-    const id = productIdInput.value;
-
-    try {
-      const response = await fetch(id ? '/products/' + id : '/products', {
-        method: id ? 'PUT' : 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload)
-      });
-
-      const data = await response.json();
-      if (!response.ok) return showMessage(data.message || 'Failed to save product.', true);
-
-      showMessage(data.message, false);
-      resetProductForm();
-      await refreshAll();
-      switchSection('productsSection');
-    } catch (error) {
-      showMessage('Network error while saving product.', true);
-    }
-  });
-
-  cancelEditBtn.addEventListener('click', resetProductForm);
-
-  productsBody.addEventListener('click', async (e) => {
-    const editData = e.target.getAttribute('data-edit-product');
-    const deleteId = e.target.getAttribute('data-delete-product');
-
-    if (editData) {
-      const product = JSON.parse(decodeURIComponent(editData));
-      productIdInput.value = product.id;
-      productNameInput.value = product.name;
-      productCategoryInput.value = product.category_id || '';
-      productQuantityInput.value = product.quantity;
-      productPriceInput.value = product.price;
-      productExpiryInput.value = product.expiry_date ? String(product.expiry_date).slice(0, 10) : '';
-      saveProductBtn.textContent = 'Update Product';
-      cancelEditBtn.classList.remove('hidden');
-      switchSection('productsSection');
-    }
-
-    if (deleteId) {
-      if (!window.confirm('Delete this product?')) return;
-
-      try {
-        const response = await fetch('/products/' + deleteId, { method: 'DELETE' });
-        const data = await response.json();
-        if (!response.ok) return showMessage(data.message || 'Failed to delete product.', true);
-
-        showMessage(data.message, false);
-        await refreshAll();
-      } catch (error) {
-        showMessage('Network error while deleting product.', true);
-      }
-    }
-  });
-
-  searchInput.addEventListener('input', async () => {
-    currentSearch = searchInput.value.trim();
-    await loadProducts();
-  });
-
-  categoryFilter.addEventListener('change', async () => {
-    currentCategoryFilter = categoryFilter.value;
-    await loadProducts();
-  });
-
-  exportCsvBtn.addEventListener('click', () => {
-    const query = new URLSearchParams();
-    if (currentSearch) {
-      query.set('search', currentSearch);
-    }
-    if (currentCategoryFilter) {
-      query.set('categoryId', currentCategoryFilter);
-    }
-    window.location.href = '/products/export/csv?' + query.toString();
-  });
-
-  categoryForm.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const name = categoryNameInput.value.trim();
-    if (!name) return showMessage('Category name is required.', true);
-
-    try {
-      const response = await fetch('/categories', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name })
-      });
-
-      const data = await response.json();
-      if (!response.ok) return showMessage(data.message || 'Failed to add category.', true);
-
-      showMessage(data.message, false);
-      categoryForm.reset();
-      await refreshAll();
-      switchSection('categoriesSection');
-    } catch (error) {
-      showMessage('Network error while adding category.', true);
-    }
-  });
-
-  categoriesBody.addEventListener('click', async (e) => {
-    const categoryId = e.target.getAttribute('data-delete-category');
-    if (!categoryId) return;
-    if (!window.confirm('Delete this category?')) return;
-
-    try {
-      const response = await fetch('/categories/' + categoryId, { method: 'DELETE' });
-      const data = await response.json();
-      if (!response.ok) return showMessage(data.message || 'Failed to delete category.', true);
-
-      showMessage(data.message, false);
-      await refreshAll();
-    } catch (error) {
-      showMessage('Network error while deleting category.', true);
-    }
-  });
-
-  logoutBtn.addEventListener('click', async () => {
-    try {
-      await fetch('/auth/logout', { method: 'POST' });
-      window.location.href = '/login';
-    } catch (error) {
-      showMessage('Network error while logging out.', true);
-    }
-  });
-
-  (async function init() {
-    try {
-      await checkSession();
-      await refreshAll();
-    } catch (error) {
-      showMessage('Unable to load data. Please login again.', true);
-      setTimeout(() => {
-        window.location.href = '/login';
-      }, 800);
-    }
-  })();
-}
-
-initLoginPage();
-initDashboardPage();
