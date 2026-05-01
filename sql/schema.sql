@@ -82,6 +82,49 @@ CREATE TABLE IF NOT EXISTS user_role_assignment (
     INDEX idx_notifications_user_read (user_id, is_read)
   );
 
+  CREATE TABLE IF NOT EXISTS product_images (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    product_id INT NOT NULL,
+    image_path VARCHAR(500) NOT NULL,
+    image_name VARCHAR(255) NOT NULL,
+    file_size INT,
+    mime_type VARCHAR(50),
+    is_primary BOOLEAN DEFAULT FALSE,
+    uploaded_by INT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_product_images_product
+      FOREIGN KEY (product_id) REFERENCES products(id)
+      ON DELETE CASCADE
+      ON UPDATE CASCADE,
+    CONSTRAINT fk_product_images_user
+      FOREIGN KEY (uploaded_by) REFERENCES users(id)
+      ON DELETE SET NULL
+      ON UPDATE CASCADE,
+    INDEX idx_product_images_product (product_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS bulk_uploads (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    file_name VARCHAR(255) NOT NULL,
+    file_path VARCHAR(500),
+    file_size INT,
+    status ENUM('pending', 'processing', 'completed', 'failed') DEFAULT 'pending',
+    total_records INT,
+    successful_records INT DEFAULT 0,
+    failed_records INT DEFAULT 0,
+    error_details TEXT,
+    upload_type VARCHAR(50),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP NULL,
+    CONSTRAINT fk_bulk_uploads_user
+      FOREIGN KEY (user_id) REFERENCES users(id)
+      ON DELETE CASCADE
+      ON UPDATE CASCADE,
+    INDEX idx_bulk_uploads_user_status (user_id, status),
+    INDEX idx_bulk_uploads_created_at (created_at)
+  );
+
 INSERT INTO categories (name)
 VALUES ('Electronics'), ('Stationery'), ('Groceries')
 ON DUPLICATE KEY UPDATE name = VALUES(name);
