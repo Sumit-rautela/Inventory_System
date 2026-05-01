@@ -33,6 +33,22 @@ CREATE TABLE IF NOT EXISTS user_roles (
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS user_role_assignment (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  user_id INT NOT NULL,
+  role_id INT NOT NULL,
+  assigned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+  CONSTRAINT fk_user_role_assignment_user
+    FOREIGN KEY (user_id) REFERENCES users(id)
+    ON DELETE CASCADE
+    ON UPDATE CASCADE,
+  CONSTRAINT fk_user_role_assignment_role
+    FOREIGN KEY (role_id) REFERENCES user_roles(id)
+    ON DELETE CASCADE
+    ON UPDATE CASCADE,
+  UNIQUE KEY unique_user_role_assignment (user_id, role_id)
+);
+
 INSERT INTO categories (name)
 VALUES ('Electronics'), ('Stationery'), ('Groceries')
 ON DUPLICATE KEY UPDATE name = VALUES(name);
