@@ -26,6 +26,20 @@ CREATE TABLE IF NOT EXISTS products (
     ON UPDATE CASCADE
 );
 
+CREATE TABLE IF NOT EXISTS user_roles (
+  id INT AUTO_INCREMENT PRIMARY KEY,
+  role_name VARCHAR(50) NOT NULL UNIQUE,
+  description VARCHAR(255),
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 INSERT INTO categories (name)
 VALUES ('Electronics'), ('Stationery'), ('Groceries')
 ON DUPLICATE KEY UPDATE name = VALUES(name);
+
+INSERT INTO user_roles (role_name, description)
+VALUES
+  ('admin', 'Administrator with full access'),
+  ('manager', 'Manager with operational access'),
+  ('staff', 'Staff with limited access')
+ON DUPLICATE KEY UPDATE description = VALUES(description);
