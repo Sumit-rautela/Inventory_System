@@ -49,6 +49,39 @@ CREATE TABLE IF NOT EXISTS user_role_assignment (
   UNIQUE KEY unique_user_role_assignment (user_id, role_id)
 );
 
+  CREATE TABLE IF NOT EXISTS activity_logs (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    action VARCHAR(100) NOT NULL,
+    entity_type VARCHAR(50),
+    entity_id INT,
+    description TEXT,
+    ip_address VARCHAR(45),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT fk_activity_logs_user
+      FOREIGN KEY (user_id) REFERENCES users(id)
+      ON DELETE CASCADE
+      ON UPDATE CASCADE,
+    INDEX idx_activity_logs_user_created (user_id, created_at),
+    INDEX idx_activity_logs_entity (entity_type, entity_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS notifications (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    user_id INT NOT NULL,
+    title VARCHAR(200) NOT NULL,
+    message TEXT NOT NULL,
+    type VARCHAR(50),
+    is_read BOOLEAN DEFAULT FALSE,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    read_at TIMESTAMP NULL,
+    CONSTRAINT fk_notifications_user
+      FOREIGN KEY (user_id) REFERENCES users(id)
+      ON DELETE CASCADE
+      ON UPDATE CASCADE,
+    INDEX idx_notifications_user_read (user_id, is_read)
+  );
+
 INSERT INTO categories (name)
 VALUES ('Electronics'), ('Stationery'), ('Groceries')
 ON DUPLICATE KEY UPDATE name = VALUES(name);
