@@ -74,10 +74,182 @@ function parseDateInput(value) {
   return { isValid: true, value: date.toISOString().slice(0, 10) };
 }
 
+function isPerishableCategoryName(categoryName) {
+  const normalizedCategoryName = String(categoryName || '').trim().toLowerCase();
+  return ['groceries', 'grocery', 'dairy'].includes(normalizedCategoryName);
+}
+
 async function getCategoryNameById(categoryId) {
   const [rows] = await db.execute('SELECT name FROM categories WHERE id = ?', [categoryId]);
   if (!rows.length) return null;
   return rows[0].name;
+}
+
+async function getCategoryNameByIdForBusiness(categoryId, businessId) {
+  const [rows] = await db.execute(
+    'SELECT name FROM categories WHERE id = ? AND business_id = ?',
+    [categoryId, businessId]
+  );
+  if (!rows.length) return null;
+  return rows[0].name;
+}
+
+async function getUserBusinessId(userId) {
+  const [rows] = await db.execute('SELECT business_id FROM users WHERE id = ?', [userId]);
+  if (!rows.length) return null;
+  return rows[0].business_id;
+}
+
+async function getUserByUsernameAndBusiness(username, businessId) {
+  const [rows] = await db.execute(
+    'SELECT id, username, business_id FROM users WHERE username = ? AND business_id = ?',
+    [username, businessId]
+  );
+
+  if (!rows.length) {
+    return null;
+  }
+
+  return rows[0];
+}
+
+async function ensureBusinessSchema() {
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS businesses (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      name VARCHAR(150) NOT NULL UNIQUE,
+      owner_user_id INT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  const columnsToEnsure = [
+    ['users', 'business_id INT NULL'],
+    ['categories', 'business_id INT NULL'],
+    ['products', 'business_id INT NULL'],
+    ['user_role_assignment', 'business_id INT NULL'],
+    ['activity_logs', 'business_id INT NULL'],
+    ['notifications', 'business_id INT NULL'],
+    ['product_images', 'business_id INT NULL'],
+    ['bulk_uploads', 'business_id INT NULL']
+  ];
+
+  for (const [tableName, columnDefinition] of columnsToEnsure) {
+    try {
+      await db.execute(`ALTER TABLE ${tableName} ADD COLUMN ${columnDefinition}`);
+    } catch (error) {
+      if (error.code !== 'ER_DUP_FIELDNAME') {
+        throw error;
+      }
+    }
+  }
+
+  const [businessRows] = await db.execute('SELECT id FROM businesses ORDER BY id ASC LIMIT 1');
+  let defaultBusinessId = businessRows[0]?.id;
+
+  if (!defaultBusinessId) {
+    const [businessResult] = await db.execute('INSERT INTO businesses (name) VALUES (?)', [
+      'Default Business'
+    ]);
+    defaultBusinessId = businessResult.insertId;
+  }
+
+  const tablesToBackfill = [
+    'users',
+    'categories',
+    'products',
+    'user_role_assignment',
+    'activity_logs',
+    'notifications',
+    'product_images',
+    'bulk_uploads'
+  ];
+
+  for (const tableName of tablesToBackfill) {
+    await db.execute(
+      `UPDATE ${tableName} SET business_id = ? WHERE business_id IS NULL`,
+      [defaultBusinessId]
+    );
+  }
+
+  const [ownerRows] = await db.execute('SELECT id FROM users ORDER BY id ASC LIMIT 1');
+  if (ownerRows.length) {
+    await db.execute('UPDATE businesses SET owner_user_id = ? WHERE id = ?', [
+      ownerRows[0].id,
+      defaultBusinessId
+    ]);
+  }
+}
+
+async function getUserRoles(userId) {
+  const [rows] = await db.execute(
+    `SELECT ur.id, ur.role_name, ur.description, ura.assigned_at
+     FROM user_roles ur
+     INNER JOIN user_role_assignment ura ON ura.role_id = ur.id
+     WHERE ura.user_id = ?
+     ORDER BY ur.role_name ASC`,
+    [userId]
+  );
+
+  return rows;
+}
+
+async function getRoleIdByName(roleName) {
+  const [rows] = await db.execute('SELECT id FROM user_roles WHERE role_name = ?', [roleName]);
+  if (!rows.length) {
+    return null;
+  }
+
+  return rows[0].id;
+}
+
+async function assignRoleToUser(userId, roleId) {
+  await db.execute('INSERT IGNORE INTO user_role_assignment (user_id, role_id) VALUES (?, ?)', [
+    userId,
+    roleId
+  ]);
+}
+
+async function ensureDefaultRoleForUser(userId) {
+  const existingRoles = await getUserRoles(userId);
+  if (existingRoles.length > 0) {
+    return existingRoles;
+  }
+
+  const staffRoleId = await getRoleIdByName('staff');
+  if (!staffRoleId) {
+    return existingRoles;
+  }
+
+  await assignRoleToUser(userId, staffRoleId);
+  return getUserRoles(userId);
+}
+
+function getSessionBusinessId(req) {
+  return req.session.user?.business_id || null;
+}
+
+function getSessionUserRoles(req) {
+  return Array.isArray(req.session.user?.roles) ? req.session.user.roles : [];
+}
+
+function hasAnyRole(req, allowedRoles) {
+  const sessionRoles = getSessionUserRoles(req);
+  return sessionRoles.some((role) => allowedRoles.includes(role));
+}
+
+function requireRole(allowedRoles) {
+  return (req, res, next) => {
+    if (!req.session.user) {
+      return res.status(401).json({ message: 'Unauthorized. Please login.' });
+    }
+
+    if (!hasAnyRole(req, allowedRoles)) {
+      return res.status(403).json({ message: 'Forbidden. Insufficient role permissions.' });
+    }
+
+    return next();
+  };
 }
 
 async function ensureProductsExpiryColumn() {
@@ -105,10 +277,14 @@ app.get('/', requireAuth, (req, res) => {
 // Auth
 app.post('/auth/register', async (req, res) => {
   try {
-    const { username, password } = req.body;
+    const { username, password, businessName } = req.body;
 
     if (!username || !password) {
       return res.status(400).json({ message: 'Username and password are required.' });
+    }
+
+    if (!businessName) {
+      return res.status(400).json({ message: 'Business name is required.' });
     }
 
     if (password.length < 6) {
@@ -121,14 +297,78 @@ app.post('/auth/register', async (req, res) => {
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
-    const [result] = await db.execute('INSERT INTO users (username, password) VALUES (?, ?)', [
-      username,
-      hashedPassword
+    const [businessResult] = await db.execute('INSERT INTO businesses (name) VALUES (?)', [
+      businessName.trim()
+    ]);
+
+    const [result] = await db.execute(
+      'INSERT INTO users (username, password, business_id) VALUES (?, ?, ?)',
+      [username, hashedPassword, businessResult.insertId]
+    );
+
+    const adminRoleId = await getRoleIdByName('admin');
+    if (adminRoleId) {
+      await assignRoleToUser(result.insertId, adminRoleId);
+    }
+
+    await db.execute('UPDATE businesses SET owner_user_id = ? WHERE id = ?', [
+      result.insertId,
+      businessResult.insertId
     ]);
 
     return res.status(201).json({ message: 'User created successfully.', userId: result.insertId });
   } catch (error) {
+    if (error.code === 'ER_DUP_ENTRY') {
+      return res.status(409).json({ message: 'Business name already exists.' });
+    }
     return res.status(500).json({ message: 'Registration failed.' });
+  }
+});
+
+app.post('/users', requireRole(['admin', 'manager']), async (req, res) => {
+  try {
+    const { username, password, roleName } = req.body;
+
+    if (!username || !password || !roleName) {
+      return res.status(400).json({ message: 'Username, password, and role are required.' });
+    }
+
+    const normalizedRoleName = String(roleName).trim().toLowerCase();
+    const currentRoles = getSessionUserRoles(req);
+    const currentBusinessId = getSessionBusinessId(req);
+
+    if (!currentBusinessId) {
+      return res.status(400).json({ message: 'Business context is missing.' });
+    }
+
+    if (currentRoles.includes('manager') && normalizedRoleName !== 'staff') {
+      return res.status(403).json({ message: 'Managers can only create staff users.' });
+    }
+
+    if (currentRoles.includes('admin') && !['manager', 'staff'].includes(normalizedRoleName)) {
+      return res.status(400).json({ message: 'Admins can only create manager or staff users.' });
+    }
+
+    const [existing] = await db.execute('SELECT id FROM users WHERE username = ?', [username]);
+    if (existing.length > 0) {
+      return res.status(409).json({ message: 'Username already exists.' });
+    }
+
+    const roleId = await getRoleIdByName(normalizedRoleName);
+    if (!roleId) {
+      return res.status(404).json({ message: 'Role not found.' });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const [result] = await db.execute(
+      'INSERT INTO users (username, password, business_id) VALUES (?, ?, ?)',
+      [username, hashedPassword, currentBusinessId]
+    );
+
+    await assignRoleToUser(result.insertId, roleId);
+    return res.status(201).json({ message: 'User created successfully.', userId: result.insertId });
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to create user.' });
   }
 });
 
@@ -140,7 +380,13 @@ app.post('/auth/login', async (req, res) => {
       return res.status(400).json({ message: 'Username and password are required.' });
     }
 
-    const [rows] = await db.execute('SELECT id, username, password FROM users WHERE username = ?', [username]);
+    const [rows] = await db.execute(
+      `SELECT u.id, u.username, u.password, u.business_id, b.name AS business_name
+       FROM users u
+       LEFT JOIN businesses b ON b.id = u.business_id
+       WHERE u.username = ?`,
+      [username]
+    );
     if (rows.length === 0) {
       return res.status(401).json({ message: 'Invalid credentials.' });
     }
@@ -151,7 +397,15 @@ app.post('/auth/login', async (req, res) => {
       return res.status(401).json({ message: 'Invalid credentials.' });
     }
 
-    req.session.user = { id: user.id, username: user.username };
+    const roles = await ensureDefaultRoleForUser(user.id);
+
+    req.session.user = {
+      id: user.id,
+      username: user.username,
+      business_id: user.business_id,
+      business_name: user.business_name,
+      roles: roles.map((role) => role.role_name)
+    };
     return res.json({ message: 'Login successful.' });
   } catch (error) {
     return res.status(500).json({ message: 'Login failed.' });
@@ -175,24 +429,158 @@ app.get('/auth/session', (req, res) => {
   return res.json({ authenticated: true, user: req.session.user });
 });
 
+app.get('/roles', requireRole(['admin']), async (req, res) => {
+  try {
+    const [rows] = await db.execute(
+      'SELECT id, role_name, description, created_at FROM user_roles ORDER BY role_name ASC'
+    );
+    return res.json(rows);
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to fetch roles.' });
+  }
+});
+
+app.get('/team/users', requireRole(['admin', 'manager']), async (req, res) => {
+  try {
+    const businessId = getSessionBusinessId(req);
+    const [rows] = await db.execute(
+      `SELECT username
+       FROM users
+       WHERE business_id = ?
+       ORDER BY username ASC`,
+      [businessId]
+    );
+
+    return res.json(rows);
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to fetch team users.' });
+  }
+});
+
+app.get('/users/by-username/:username/roles', requireRole(['admin']), async (req, res) => {
+  try {
+    const username = String(req.params.username || '').trim();
+    if (!username) {
+      return res.status(400).json({ message: 'Invalid username.' });
+    }
+
+    const currentBusinessId = getSessionBusinessId(req);
+    const user = await getUserByUsernameAndBusiness(username, currentBusinessId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found in this business.' });
+    }
+
+    const userBusinessId = user.business_id;
+    if (String(userBusinessId) !== String(currentBusinessId)) {
+      return res.status(403).json({ message: 'Forbidden. Cross-business access is not allowed.' });
+    }
+
+    const roles = await getUserRoles(user.id);
+    return res.json(roles);
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to fetch user roles.' });
+  }
+});
+
+app.post('/users/by-username/:username/roles', requireRole(['admin']), async (req, res) => {
+  try {
+    const username = String(req.params.username || '').trim();
+    const { roleName } = req.body;
+
+    if (!username) {
+      return res.status(400).json({ message: 'Invalid username.' });
+    }
+
+    if (!roleName) {
+      return res.status(400).json({ message: 'roleName is required.' });
+    }
+
+    const normalizedRoleName = String(roleName).trim().toLowerCase();
+    if (!['manager', 'staff'].includes(normalizedRoleName)) {
+      return res.status(400).json({ message: 'Only manager and staff roles can be assigned here.' });
+    }
+
+    const currentBusinessId = getSessionBusinessId(req);
+    const user = await getUserByUsernameAndBusiness(username, currentBusinessId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    const roleId = await getRoleIdByName(normalizedRoleName);
+    if (!roleId) {
+      return res.status(404).json({ message: 'Role not found.' });
+    }
+
+    await assignRoleToUser(user.id, roleId);
+    const roles = await getUserRoles(user.id);
+    return res.status(201).json({ message: 'Role assigned successfully.', roles });
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to assign role.' });
+  }
+});
+
+app.delete('/users/by-username/:username/roles/:roleId', requireRole(['admin']), async (req, res) => {
+  try {
+    const username = String(req.params.username || '').trim();
+    const roleId = Number(req.params.roleId);
+
+    if (!username || !Number.isInteger(roleId) || roleId <= 0) {
+      return res.status(400).json({ message: 'Invalid username or role id.' });
+    }
+
+    const currentBusinessId = getSessionBusinessId(req);
+    const user = await getUserByUsernameAndBusiness(username, currentBusinessId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    const userBusinessId = user.business_id;
+    if (String(userBusinessId) !== String(currentBusinessId)) {
+      return res.status(403).json({ message: 'Forbidden. Cross-business access is not allowed.' });
+    }
+
+    const [result] = await db.execute(
+      'DELETE FROM user_role_assignment WHERE user_id = ? AND role_id = ?',
+      [user.id, roleId]
+    );
+
+    if (!result.affectedRows) {
+      return res.status(404).json({ message: 'Role assignment not found.' });
+    }
+
+    const roles = await getUserRoles(user.id);
+    return res.json({ message: 'Role removed successfully.', roles });
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to remove role.' });
+  }
+});
+
 // Categories
 app.get('/categories', requireAuth, async (req, res) => {
   try {
-    const [rows] = await db.execute('SELECT id, name FROM categories ORDER BY name ASC');
+    const businessId = getSessionBusinessId(req);
+    const [rows] = await db.execute(
+      'SELECT id, name FROM categories WHERE business_id = ? ORDER BY name ASC',
+      [businessId]
+    );
     return res.json(rows);
   } catch (error) {
     return res.status(500).json({ message: 'Failed to fetch categories.' });
   }
 });
 
-app.post('/categories', requireAuth, async (req, res) => {
+app.post('/categories', requireRole(['admin', 'manager']), async (req, res) => {
   try {
     const { name } = req.body;
     if (!name) {
       return res.status(400).json({ message: 'Category name is required.' });
     }
 
-    const [result] = await db.execute('INSERT INTO categories (name) VALUES (?)', [name]);
+    const businessId = getSessionBusinessId(req);
+    const [result] = await db.execute('INSERT INTO categories (name, business_id) VALUES (?, ?)', [
+      name,
+      businessId
+    ]);
     return res.status(201).json({ message: 'Category added successfully.', categoryId: result.insertId });
   } catch (error) {
     if (error.code === 'ER_DUP_ENTRY') {
@@ -202,14 +590,18 @@ app.post('/categories', requireAuth, async (req, res) => {
   }
 });
 
-app.delete('/categories/:id', requireAuth, async (req, res) => {
+app.delete('/categories/:id', requireRole(['admin', 'manager']), async (req, res) => {
   try {
     const parsedId = Number(req.params.id);
     if (!Number.isInteger(parsedId) || parsedId <= 0) {
       return res.status(400).json({ message: 'Invalid category id.' });
     }
 
-    const [result] = await db.execute('DELETE FROM categories WHERE id = ?', [parsedId]);
+    const businessId = getSessionBusinessId(req);
+    const [result] = await db.execute('DELETE FROM categories WHERE id = ? AND business_id = ?', [
+      parsedId,
+      businessId
+    ]);
     if (!result.affectedRows) {
       return res.status(404).json({ message: 'Category not found.' });
     }
@@ -227,13 +619,14 @@ app.get('/products', requireAuth, async (req, res) => {
   try {
     const { search = '', categoryId = '' } = req.query;
     const normalizedCategoryId = String(categoryId || '').trim().toLowerCase();
+    const businessId = getSessionBusinessId(req);
     let sql = `
       SELECT p.id, p.name, p.quantity, p.price, p.expiry_date, p.created_at, c.id AS category_id, c.name AS category_name
       FROM products p
-      LEFT JOIN categories c ON p.category_id = c.id
-      WHERE 1 = 1
+      LEFT JOIN categories c ON p.category_id = c.id AND c.business_id = p.business_id
+      WHERE p.business_id = ?
     `;
-    const params = [];
+    const params = [businessId];
 
     if (search) {
       sql += ' AND p.name LIKE ?';
@@ -259,7 +652,7 @@ app.get('/products', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/products', requireAuth, async (req, res) => {
+app.post('/products', requireRole(['admin', 'manager']), async (req, res) => {
   try {
     const { name, category_id, quantity, price, expiry_date } = req.body;
     if (!name || !category_id || quantity === undefined || price === undefined) {
@@ -280,7 +673,8 @@ app.post('/products', requireAuth, async (req, res) => {
       return res.status(400).json({ message: 'Invalid product values.' });
     }
 
-    const categoryName = await getCategoryNameById(parsedCategoryId);
+    const businessId = getSessionBusinessId(req);
+    const categoryName = await getCategoryNameByIdForBusiness(parsedCategoryId, businessId);
     if (!categoryName) {
       return res.status(400).json({ message: 'Invalid category.' });
     }
@@ -290,16 +684,16 @@ app.post('/products', requireAuth, async (req, res) => {
       return res.status(400).json({ message: 'Invalid expiry date.' });
     }
 
-    const isGroceries = categoryName.trim().toLowerCase() === 'groceries';
-    if (isGroceries && !parsedExpiryDate.value) {
-      return res.status(400).json({ message: 'Expiry date is required for groceries products.' });
+    const isPerishable = isPerishableCategoryName(categoryName);
+    if (isPerishable && !parsedExpiryDate.value) {
+      return res.status(400).json({ message: 'Expiry date is required for perishable products.' });
     }
 
-    const finalExpiryDate = isGroceries ? parsedExpiryDate.value : null;
+    const finalExpiryDate = isPerishable ? parsedExpiryDate.value : null;
 
     const [result] = await db.execute(
-      'INSERT INTO products (name, category_id, quantity, price, expiry_date) VALUES (?, ?, ?, ?, ?)',
-      [name, parsedCategoryId, parsedQuantity, parsedPrice, finalExpiryDate]
+      'INSERT INTO products (name, category_id, quantity, price, expiry_date, business_id) VALUES (?, ?, ?, ?, ?, ?)',
+      [name, parsedCategoryId, parsedQuantity, parsedPrice, finalExpiryDate, businessId]
     );
 
     return res.status(201).json({ message: 'Product added successfully.', productId: result.insertId });
@@ -308,7 +702,7 @@ app.post('/products', requireAuth, async (req, res) => {
   }
 });
 
-app.put('/products/:id', requireAuth, async (req, res) => {
+app.put('/products/:id', requireRole(['admin', 'manager']), async (req, res) => {
   try {
     const { name, category_id, quantity, price, expiry_date } = req.body;
     if (!name || !category_id || quantity === undefined || price === undefined) {
@@ -332,7 +726,8 @@ app.put('/products/:id', requireAuth, async (req, res) => {
       return res.status(400).json({ message: 'Invalid product values.' });
     }
 
-    const categoryName = await getCategoryNameById(parsedCategoryId);
+    const businessId = getSessionBusinessId(req);
+    const categoryName = await getCategoryNameByIdForBusiness(parsedCategoryId, businessId);
     if (!categoryName) {
       return res.status(400).json({ message: 'Invalid category.' });
     }
@@ -342,16 +737,16 @@ app.put('/products/:id', requireAuth, async (req, res) => {
       return res.status(400).json({ message: 'Invalid expiry date.' });
     }
 
-    const isGroceries = categoryName.trim().toLowerCase() === 'groceries';
-    if (isGroceries && !parsedExpiryDate.value) {
-      return res.status(400).json({ message: 'Expiry date is required for groceries products.' });
+    const isPerishable = isPerishableCategoryName(categoryName);
+    if (isPerishable && !parsedExpiryDate.value) {
+      return res.status(400).json({ message: 'Expiry date is required for perishable products.' });
     }
 
-    const finalExpiryDate = isGroceries ? parsedExpiryDate.value : null;
+    const finalExpiryDate = isPerishable ? parsedExpiryDate.value : null;
 
     const [result] = await db.execute(
-      'UPDATE products SET name = ?, category_id = ?, quantity = ?, price = ?, expiry_date = ? WHERE id = ?',
-      [name, parsedCategoryId, parsedQuantity, parsedPrice, finalExpiryDate, parsedId]
+      'UPDATE products SET name = ?, category_id = ?, quantity = ?, price = ?, expiry_date = ? WHERE id = ? AND business_id = ?',
+      [name, parsedCategoryId, parsedQuantity, parsedPrice, finalExpiryDate, parsedId, businessId]
     );
 
     if (!result.affectedRows) {
@@ -364,14 +759,18 @@ app.put('/products/:id', requireAuth, async (req, res) => {
   }
 });
 
-app.delete('/products/:id', requireAuth, async (req, res) => {
+app.delete('/products/:id', requireRole(['admin', 'manager']), async (req, res) => {
   try {
     const parsedId = Number(req.params.id);
     if (!Number.isInteger(parsedId) || parsedId <= 0) {
       return res.status(400).json({ message: 'Invalid product id.' });
     }
 
-    const [result] = await db.execute('DELETE FROM products WHERE id = ?', [parsedId]);
+    const businessId = getSessionBusinessId(req);
+    const [result] = await db.execute('DELETE FROM products WHERE id = ? AND business_id = ?', [
+      parsedId,
+      businessId
+    ]);
     if (!result.affectedRows) {
       return res.status(404).json({ message: 'Product not found.' });
     }
@@ -385,13 +784,14 @@ app.get('/products/export/csv', requireAuth, async (req, res) => {
   try {
     const { search = '', categoryId = '' } = req.query;
     const normalizedCategoryId = String(categoryId || '').trim().toLowerCase();
+    const businessId = getSessionBusinessId(req);
     let sql = `
       SELECT p.id, p.name, p.quantity, p.price, p.expiry_date, p.created_at, c.name AS category_name
       FROM products p
-      LEFT JOIN categories c ON p.category_id = c.id
-      WHERE 1 = 1
+      LEFT JOIN categories c ON p.category_id = c.id AND c.business_id = p.business_id
+      WHERE p.business_id = ?
     `;
-    const params = [];
+    const params = [businessId];
 
     if (search) {
       sql += ' AND p.name LIKE ?';
@@ -434,30 +834,41 @@ app.get('/products/export/csv', requireAuth, async (req, res) => {
 // Dashboard
 app.get('/dashboard', requireAuth, async (req, res) => {
   try {
-    const [totalRows] = await db.execute('SELECT COUNT(*) AS total FROM products');
+    const businessId = getSessionBusinessId(req);
+    const [totalRows] = await db.execute('SELECT COUNT(*) AS total FROM products WHERE business_id = ?', [
+      businessId
+    ]);
     const [lowStockRows] = await db.execute(
       `SELECT p.id, p.name, p.quantity, p.price, p.expiry_date, c.name AS category_name
        FROM products p
-       LEFT JOIN categories c ON p.category_id = c.id
-       WHERE p.quantity < 10
-       ORDER BY p.quantity ASC`
+       LEFT JOIN categories c ON p.category_id = c.id AND c.business_id = p.business_id
+       WHERE p.business_id = ? AND p.quantity < 10
+       ORDER BY p.quantity ASC`,
+      [businessId]
     );
     const [recentRows] = await db.execute(
       `SELECT p.id, p.name, p.quantity, p.price, p.expiry_date, p.created_at, c.name AS category_name
        FROM products p
-       LEFT JOIN categories c ON p.category_id = c.id
+       LEFT JOIN categories c ON p.category_id = c.id AND c.business_id = p.business_id
+       WHERE p.business_id = ?
        ORDER BY p.created_at DESC
-       LIMIT 5`
+       LIMIT 5`,
+      [businessId]
     );
     const [expiringRows] = await db.execute(
       `SELECT p.id, p.name, p.quantity, p.price, p.expiry_date, c.name AS category_name
        FROM products p
-       LEFT JOIN categories c ON p.category_id = c.id
-       WHERE p.expiry_date IS NOT NULL
+       LEFT JOIN categories c ON p.category_id = c.id AND c.business_id = p.business_id
+       WHERE p.business_id = ?
+         AND p.expiry_date IS NOT NULL
          AND DATEDIFF(p.expiry_date, CURDATE()) BETWEEN 0 AND 7
-       ORDER BY p.expiry_date ASC`
+       ORDER BY p.expiry_date ASC`,
+      [businessId]
     );
-    const [valueRows] = await db.execute('SELECT IFNULL(SUM(quantity * price), 0) AS totalValue FROM products');
+    const [valueRows] = await db.execute(
+      'SELECT IFNULL(SUM(quantity * price), 0) AS totalValue FROM products WHERE business_id = ?',
+      [businessId]
+    );
 
     return res.json({
       totalProducts: totalRows[0].total,
@@ -486,7 +897,8 @@ app.use((error, req, res, next) => {
 });
 
 const PORT = Number(process.env.PORT || 3000);
-ensureProductsExpiryColumn()
+ensureBusinessSchema()
+  .then(() => ensureProductsExpiryColumn())
   .then(() => {
     app.listen(PORT, () => {
       console.log(`Server running at http://localhost:${PORT}`);

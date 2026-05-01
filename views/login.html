@@ -10,7 +10,7 @@
   <div class="auth-shell">
     <div class="auth-card">
       <h1>Inventory System</h1>
-      <p class="subtitle">Login to manage products, stock, and categories.</p>
+      <p class="subtitle">Login to manage products, stock, and categories. New registration creates a business admin account.</p>
 
       <div class="auth-tabs">
         <button id="showLoginBtn" class="tab-btn active" type="button">Login</button>
@@ -34,19 +34,22 @@
         <label for="registerUsername">Username</label>
         <input id="registerUsername" name="username" type="text" required minlength="3" />
 
+        <label for="registerBusinessName">Business Name</label>
+        <input id="registerBusinessName" name="businessName" type="text" required minlength="2" placeholder="Your business name" />
+
         <label for="registerPassword">Password</label>
         <div class="password-wrap">
           <input id="registerPassword" name="password" type="password" required minlength="6" />
           <button type="button" class="password-toggle" data-target="registerPassword">Show</button>
         </div>
 
-        <button type="submit" class="btn-primary">Create Account</button>
+        <button type="submit" class="btn-primary">Create Business Admin Account</button>
       </form>
 
       <p id="authMessage" class="message"></p>
     </div>
   </div>
 
-  <script src="/public/App.js"></script>
+  <script src="/public/App.js?v=2"></script>
 </body>
 </html>

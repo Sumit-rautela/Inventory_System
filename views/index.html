@@ -14,6 +14,7 @@
         <button class="nav-btn active" data-section="dashboardSection">Dashboard</button>
         <button class="nav-btn" data-section="productsSection">Products</button>
         <button class="nav-btn" data-section="categoriesSection">Categories</button>
+        <button class="nav-btn hidden" data-section="rolesSection" data-role-only="admin,manager">Team</button>
         <button id="logoutBtn" class="nav-btn danger">Logout</button>
       </nav>
     </aside>
@@ -23,6 +24,71 @@
         <h1>Inventory Management System</h1>
         <p id="welcomeText"></p>
       </header>
+
+      <section id="rolesSection" class="panel" data-role-only="admin,manager">
+        <h3>Team Management</h3>
+        <p class="subtitle">Admins can create managers and staff. Managers can create staff only.</p>
+
+        <form id="teamForm" class="form-grid compact-grid">
+          <div>
+            <label for="teamUsername">Username</label>
+            <input id="teamUsername" type="text" minlength="3" required />
+          </div>
+          <div>
+            <label for="teamPassword">Password</label>
+            <input id="teamPassword" type="password" minlength="6" required />
+          </div>
+          <div>
+            <label for="teamRole">Role</label>
+            <select id="teamRole" required></select>
+          </div>
+          <div class="span-2">
+            <button type="submit" class="btn-primary">Create User</button>
+          </div>
+        </form>
+
+        <div class="separator"></div>
+
+        <div data-role-only="admin">
+          <h4>Assign Existing User Role</h4>
+          <p class="subtitle">Admins can assign manager or staff roles to users in the same business.</p>
+
+          <form id="roleForm" class="form-grid compact-grid">
+            <div>
+              <label for="roleUsername">Username</label>
+              <input id="roleUsername" list="teamUsernames" type="text" minlength="3" placeholder="Enter username" required />
+            </div>
+            <div>
+              <label for="roleName">Role</label>
+              <select id="roleName" required></select>
+            </div>
+            <div class="span-2">
+              <button type="submit" class="btn-primary">Assign Role</button>
+            </div>
+          </form>
+
+          <div class="filters compact-filters">
+            <input id="roleLookupUsername" list="teamUsernames" type="text" minlength="3" placeholder="View roles for username" />
+            <button id="loadUserRolesBtn" class="btn-secondary" type="button">Load User Roles</button>
+          </div>
+
+          <datalist id="teamUsernames"></datalist>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Role</th>
+                  <th>Description</th>
+                  <th>Assigned At</th>
+                  <th>Action</th>
+                </tr>
+              </thead>
+              <tbody id="userRolesBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
 
       <section id="dashboardSection" class="panel visible">
         <h3>Dashboard</h3>
@@ -109,7 +175,7 @@
             <input id="productPrice" type="number" min="0" step="0.01" required />
           </div>
           <div>
-            <label for="productExpiry">Expiry Date (Groceries)</label>
+            <label for="productExpiry">Expiry Date (Perishable Items)</label>
             <input id="productExpiry" type="date" />
           </div>
           <div class="span-2">
@@ -144,7 +210,7 @@
       <section id="categoriesSection" class="panel">
         <h3>Categories</h3>
 
-        <form id="categoryForm" class="inline-form">
+        <form id="categoryForm" class="inline-form" data-role-only="admin,manager">
           <input id="categoryName" type="text" placeholder="Category name" required />
           <button type="submit" class="btn-primary">Add Category</button>
         </form>
@@ -166,6 +232,6 @@
     </main>
   </div>
 
-  <script src="/public/App.js"></script>
+  <script src="/public/App.js?v=2"></script>
 </body>
 </html>

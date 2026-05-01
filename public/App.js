@@ -70,6 +70,7 @@ function initLoginPage() {
     try {
       const response = await fetch('/auth/login', {
         method: 'POST',
+        credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username, password })
       });
@@ -90,16 +91,18 @@ function initLoginPage() {
 
     const username = document.getElementById('registerUsername').value.trim();
     const password = document.getElementById('registerPassword').value.trim();
+    const businessName = document.getElementById('registerBusinessName').value.trim();
 
-    if (username.length < 3 || password.length < 6) {
-      return showTextMessage(authMessage, 'Username must be 3+ chars and password 6+ chars.', true);
+    if (username.length < 3 || password.length < 6 || businessName.length < 2) {
+      return showTextMessage(authMessage, 'Enter a username, business name, and password with valid length.', true);
     }
 
     try {
       const response = await fetch('/auth/register', {
         method: 'POST',
+        credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password })
+        body: JSON.stringify({ username, password, businessName })
       });
 
       const data = await response.json();
@@ -119,6 +122,7 @@ function initLoginPage() {
 function initDashboardPage() {
   const sections = document.querySelectorAll('.panel');
   const navButtons = document.querySelectorAll('.nav-btn[data-section]');
+  const roleRestrictedElements = document.querySelectorAll('[data-role-only]');
   const globalMessage = document.getElementById('globalMessage');
   const welcomeText = document.getElementById('welcomeText');
 
@@ -139,6 +143,19 @@ function initDashboardPage() {
   const categoryForm = document.getElementById('categoryForm');
   const categoryNameInput = document.getElementById('categoryName');
 
+  const roleForm = document.getElementById('roleForm');
+  const roleUsernameInput = document.getElementById('roleUsername');
+  const roleNameInput = document.getElementById('roleName');
+  const roleLookupUsernameInput = document.getElementById('roleLookupUsername');
+  const loadUserRolesBtn = document.getElementById('loadUserRolesBtn');
+  const userRolesBody = document.getElementById('userRolesBody');
+  const teamUsernamesList = document.getElementById('teamUsernames');
+
+  const teamForm = document.getElementById('teamForm');
+  const teamUsernameInput = document.getElementById('teamUsername');
+  const teamPasswordInput = document.getElementById('teamPassword');
+  const teamRoleInput = document.getElementById('teamRole');
+
   const productsBody = document.getElementById('productsBody');
   const categoriesBody = document.getElementById('categoriesBody');
   const lowStockProductsBody = document.getElementById('lowStockProductsBody');
@@ -155,9 +172,101 @@ function initDashboardPage() {
   let currentSearch = '';
   let currentCategoryFilter = '';
   let categoriesCache = [];
+  let currentUser = { roles: [] };
+  let roleAssignmentsCache = [];
 
   function showMessage(text, isError) {
     showTextMessage(globalMessage, text, !!isError);
+  }
+
+  function getUserRoles() {
+    return Array.isArray(currentUser.roles) ? currentUser.roles : [];
+  }
+
+  function hasRole(roleName) {
+    return getUserRoles().includes(roleName);
+  }
+
+  function hasAnyRole(roleNames) {
+    return roleNames.some((roleName) => hasRole(roleName));
+  }
+
+  function canManageInventory() {
+    return hasAnyRole(['admin', 'manager']);
+  }
+
+  function canManageRoles() {
+    return hasRole('admin');
+  }
+
+  function canManageTeam() {
+    return hasAnyRole(['admin', 'manager']);
+  }
+
+  function getAssignableTeamRoles() {
+    if (hasRole('admin')) {
+      return ['manager', 'staff'];
+    }
+
+    if (hasRole('manager')) {
+      return ['staff'];
+    }
+
+    return [];
+  }
+
+  function applyRoleVisibility() {
+    roleRestrictedElements.forEach((element) => {
+      const allowedRoles = String(element.getAttribute('data-role-only') || '')
+        .split(',')
+        .map((role) => role.trim())
+        .filter(Boolean);
+      const visible = allowedRoles.length === 0 || allowedRoles.some((role) => hasRole(role));
+      element.classList.toggle('hidden', !visible);
+    });
+
+    const inventoryLocked = !canManageInventory();
+    const rolesLocked = !canManageRoles();
+
+    [productForm, categoryForm, roleForm, teamForm].forEach((form) => {
+      if (!form) return;
+      form.querySelectorAll('input, select, button').forEach((field) => {
+        if (field.closest('#teamForm')) {
+          field.disabled = !canManageTeam();
+          return;
+        }
+
+        if (field.closest('#roleForm')) {
+          field.disabled = rolesLocked;
+          return;
+        }
+
+        if (field.closest('#categoryForm')) {
+          field.disabled = !hasAnyRole(['admin', 'manager']);
+          return;
+        }
+
+        if (field.closest('#productForm')) {
+          field.disabled = inventoryLocked;
+        }
+      });
+    });
+
+    const productButtons = document.querySelectorAll('[data-edit-product], [data-delete-product]');
+    productButtons.forEach((button) => {
+      button.disabled = inventoryLocked;
+      button.classList.toggle('hidden', inventoryLocked);
+    });
+
+    const categoryButtons = document.querySelectorAll('[data-delete-category]');
+    categoryButtons.forEach((button) => {
+      button.disabled = !hasAnyRole(['admin', 'manager']);
+      button.classList.toggle('hidden', !hasAnyRole(['admin', 'manager']));
+    });
+  }
+
+  function getDefaultSectionForUser() {
+    return 'dashboardSection';
   }
 
   function switchSection(sectionId) {
@@ -178,7 +287,10 @@ function initDashboardPage() {
 
   function isGroceriesByCategoryId(categoryId) {
     const category = categoriesCache.find((item) => String(item.id) === String(categoryId));
-    return !!category && category.name.trim().toLowerCase() === 'groceries';
+    if (!category) return false;
+
+    const normalizedCategoryName = category.name.trim().toLowerCase();
+    return ['groceries', 'grocery', 'dairy'].includes(normalizedCategoryName);
   }
 
   function formatExpiryDate(expiryDate) {
@@ -189,7 +301,8 @@ function initDashboardPage() {
   }
 
   function isExpiryWarning(product) {
-    if (!product || String(product.category_name || '').trim().toLowerCase() !== 'groceries' || !product.expiry_date) {
+    const normalizedCategoryName = String(product?.category_name || '').trim().toLowerCase();
+    if (!product || !['groceries', 'grocery', 'dairy'].includes(normalizedCategoryName) || !product.expiry_date) {
       return false;
     }
 
@@ -216,18 +329,106 @@ function initDashboardPage() {
   }
 
   async function checkSession() {
-    const response = await fetch('/auth/session');
+    const response = await fetch('/auth/session', { credentials: 'same-origin' });
     if (!response.ok) {
       window.location.href = '/login';
       return;
     }
 
     const data = await response.json();
-    welcomeText.textContent = 'Logged in as: ' + data.user.username;
+    currentUser = data.user || { roles: [] };
+    const roleLabel = getUserRoles().length ? getUserRoles().join(', ') : 'no roles assigned';
+    const businessLabel = currentUser.business_name ? ' @ ' + currentUser.business_name : '';
+    welcomeText.textContent = 'Logged in as: ' + currentUser.username + businessLabel + ' (' + roleLabel + ')';
+    applyRoleVisibility();
+  }
+
+  async function loadAvailableRoles() {
+    if (!roleNameInput || !canManageRoles()) return;
+
+    const response = await fetch('/roles', { credentials: 'same-origin' });
+    if (!response.ok) throw new Error('Unable to load roles');
+
+    const roles = await response.json();
+    roleNameInput.innerHTML = '';
+    roles.forEach((role) => {
+      const option = document.createElement('option');
+      option.value = role.role_name;
+      option.textContent = role.role_name;
+      roleNameInput.appendChild(option);
+    });
+  }
+
+  async function loadTeamUsers() {
+    if (!teamUsernamesList || !canManageTeam()) return;
+
+    const response = await fetch('/team/users', { credentials: 'same-origin' });
+    if (!response.ok) throw new Error('Unable to load team users');
+
+    const users = await response.json();
+    teamUsernamesList.innerHTML = '';
+    users.forEach((user) => {
+      const option = document.createElement('option');
+      option.value = user.username;
+      teamUsernamesList.appendChild(option);
+    });
+  }
+
+  function populateTeamRoles() {
+    if (!teamRoleInput || !canManageTeam()) return;
+
+    const roles = getAssignableTeamRoles();
+    teamRoleInput.innerHTML = '';
+    roles.forEach((role) => {
+      const option = document.createElement('option');
+      option.value = role;
+      option.textContent = role;
+      teamRoleInput.appendChild(option);
+    });
+  }
+
+  function renderUserRoles(rows) {
+    if (!userRolesBody) return;
+
+    userRolesBody.innerHTML = '';
+    if (!rows.length) {
+      const row = document.createElement('tr');
+      row.innerHTML = '<td colspan="4">No roles found for this user.</td>';
+      userRolesBody.appendChild(row);
+      return;
+    }
+
+    rows.forEach((role) => {
+      const row = document.createElement('tr');
+      row.innerHTML =
+        '<td>' + escapeHtml(role.role_name) + '</td>' +
+        '<td>' + escapeHtml(role.description || '-') + '</td>' +
+        '<td>' + (role.assigned_at ? new Date(role.assigned_at).toLocaleString() : '-') + '</td>' +
+        '<td>' +
+          '<button class="btn-danger" data-remove-role="' + role.id + '">Remove</button>' +
+        '</td>';
+      userRolesBody.appendChild(row);
+    });
+
+    applyRoleVisibility();
+  }
+
+  async function loadUserRoles(username) {
+    if (!username) {
+      roleAssignmentsCache = [];
+      renderUserRoles([]);
+      return;
+    }
+
+    const response = await fetch('/users/by-username/' + encodeURIComponent(username) + '/roles', { credentials: 'same-origin' });
+    if (!response.ok) throw new Error('Unable to load user roles');
+
+    roleAssignmentsCache = await response.json();
+    renderUserRoles(roleAssignmentsCache);
   }
 
   async function loadCategories() {
-    const response = await fetch('/categories');
+    const response = await fetch('/categories', { credentials: 'same-origin' });
     if (!response.ok) throw new Error('Unable to load categories');
 
     const categories = await response.json();
@@ -253,6 +454,8 @@ function initDashboardPage() {
         '<td><button class="btn-danger" data-delete-category="' + category.id + '">Delete</button></td>';
       categoriesBody.appendChild(row);
     });
+
+    applyRoleVisibility();
   }
 
   async function loadProducts() {
@@ -264,7 +467,7 @@ function initDashboardPage() {
       query.set('categoryId', currentCategoryFilter);
     }
 
-    const response = await fetch('/products?' + query.toString());
+    const response = await fetch('/products?' + query.toString(), { credentials: 'same-origin' });
     if (!response.ok) throw new Error('Unable to load products');
 
     const products = await response.json();
@@ -286,10 +489,12 @@ function initDashboardPage() {
         '</td>';
       productsBody.appendChild(row);
     });
+
+    applyRoleVisibility();
   }
 
   async function loadDashboard() {
-    const response = await fetch('/dashboard');
+    const response = await fetch('/dashboard', { credentials: 'same-origin' });
     if (!response.ok) throw new Error('Unable to load dashboard');
 
     const data = await response.json();
@@ -353,8 +558,65 @@ function initDashboardPage() {
     btn.addEventListener('click', () => switchSection(btn.dataset.section));
   });
 
+  if (loadUserRolesBtn) {
+    loadUserRolesBtn.addEventListener('click', async () => {
+      const username = roleLookupUsernameInput.value.trim();
+      if (!username) {
+        return showMessage('Enter a valid username to load roles.', true);
+      }
+
+      try {
+        await loadUserRoles(username);
+        showMessage('Loaded roles for ' + username + '.', false);
+      } catch (error) {
+        showMessage('Unable to load roles for this user.', true);
+      }
+    });
+  }
+
+  if (teamForm) {
+    teamForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+
+      if (!canManageTeam()) {
+        return showMessage('You do not have permission to create team members.', true);
+      }
+
+      const username = teamUsernameInput.value.trim();
+      const password = teamPasswordInput.value.trim();
+      const roleName = teamRoleInput.value;
+
+      if (username.length < 3 || password.length < 6 || !roleName) {
+        return showMessage('Enter a valid username, password, and role.', true);
+      }
+
+      try {
+        const response = await fetch('/users', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, password, roleName })
+        });
+
+        const data = await response.json();
+        if (!response.ok) return showMessage(data.message || 'Failed to create user.', true);
+
+        showMessage(data.message, false);
+        teamForm.reset();
+        populateTeamRoles();
+        await loadTeamUsers();
+      } catch (error) {
+        showMessage('Network error while creating user.', true);
+      }
+    });
+  }
+
   productForm.addEventListener('submit', async (e) => {
     e.preventDefault();
+
+    if (!canManageInventory()) {
+      return showMessage('You do not have permission to manage products.', true);
+    }
 
     const payload = {
       name: productNameInput.value.trim(),
@@ -369,7 +631,7 @@ function initDashboardPage() {
     }
 
     if (isGroceriesByCategoryId(payload.category_id) && !payload.expiry_date) {
-      return showMessage('Expiry date is required for groceries products.', true);
+      return showMessage('Expiry date is required for perishable products.', true);
     }
 
     const id = productIdInput.value;
@@ -377,6 +639,7 @@ function initDashboardPage() {
     try {
       const response = await fetch(id ? '/products/' + id : '/products', {
         method: id ? 'PUT' : 'POST',
+        credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
@@ -399,7 +662,13 @@ function initDashboardPage() {
     const editData = e.target.getAttribute('data-edit-product');
     const deleteId = e.target.getAttribute('data-delete-product');
 
+    if (e.target.getAttribute('data-remove-role')) return;
+
     if (editData) {
+      if (!canManageInventory()) {
+        return showMessage('You do not have permission to edit products.', true);
+      }
+
       const product = JSON.parse(decodeURIComponent(editData));
       productIdInput.value = product.id;
       productNameInput.value = product.name;
@@ -413,10 +682,14 @@ function initDashboardPage() {
     }
 
     if (deleteId) {
+      if (!canManageInventory()) {
+        return showMessage('You do not have permission to delete products.', true);
+      }
+
       if (!window.confirm('Delete this product?')) return;
 
       try {
-        const response = await fetch('/products/' + deleteId, { method: 'DELETE' });
+        const response = await fetch('/products/' + deleteId, { method: 'DELETE', credentials: 'same-origin' });
         const data = await response.json();
         if (!response.ok) return showMessage(data.message || 'Failed to delete product.', true);
 
@@ -451,12 +724,17 @@ function initDashboardPage() {
 
   categoryForm.addEventListener('submit', async (e) => {
     e.preventDefault();
+    if (!hasAnyRole(['admin', 'manager'])) {
+      return showMessage('You do not have permission to manage categories.', true);
+    }
+
     const name = categoryNameInput.value.trim();
     if (!name) return showMessage('Category name is required.', true);
 
     try {
       const response = await fetch('/categories', {
         method: 'POST',
+        credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name })
       });
@@ -476,10 +754,13 @@ function initDashboardPage() {
   categoriesBody.addEventListener('click', async (e) => {
     const categoryId = e.target.getAttribute('data-delete-category');
     if (!categoryId) return;
+    if (!hasAnyRole(['admin', 'manager'])) {
+      return showMessage('You do not have permission to delete categories.', true);
+    }
     if (!window.confirm('Delete this category?')) return;
 
     try {
-      const response = await fetch('/categories/' + categoryId, { method: 'DELETE' });
+      const response = await fetch('/categories/' + categoryId, { method: 'DELETE', credentials: 'same-origin' });
       const data = await response.json();
       if (!response.ok) return showMessage(data.message || 'Failed to delete category.', true);
 
@@ -490,9 +771,72 @@ function initDashboardPage() {
     }
   });
 
+  if (roleForm) {
+    roleForm.addEventListener('submit', async (e) => {
+      e.preventDefault();
+      if (!canManageRoles()) {
+        return showMessage('You do not have permission to manage roles.', true);
+      }
+
+      const username = roleUsernameInput.value.trim();
+      const roleName = roleNameInput.value;
+
+      if (!username || !roleName) {
+        return showMessage('Please enter a valid username and role.', true);
+      }
+
+      try {
+        const response = await fetch('/users/by-username/' + encodeURIComponent(username) + '/roles', {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ roleName })
+        });
+
+        const data = await response.json();
+        if (!response.ok) return showMessage(data.message || 'Failed to assign role.', true);
+
+        showMessage(data.message, false);
+        await loadAvailableRoles();
+        await loadUserRoles(username);
+      } catch (error) {
+        showMessage('Network error while assigning role.', true);
+      }
+    });
+  }
+
+  if (userRolesBody) {
+    userRolesBody.addEventListener('click', async (e) => {
+      const roleId = e.target.getAttribute('data-remove-role');
+      if (!roleId || !canManageRoles()) return;
+
+      const username = roleLookupUsernameInput.value.trim() || roleUsernameInput.value.trim();
+      if (!username) {
+        return showMessage('Enter a username first to remove a role.', true);
+      }
+
+      if (!window.confirm('Remove this role from the user?')) return;
+
+      try {
+        const response = await fetch('/users/by-username/' + encodeURIComponent(username) + '/roles/' + roleId, {
+          method: 'DELETE',
+          credentials: 'same-origin'
+        });
+
+        const data = await response.json();
+        if (!response.ok) return showMessage(data.message || 'Failed to remove role.', true);
+
+        showMessage(data.message, false);
+        await loadUserRoles(username);
+      } catch (error) {
+        showMessage('Network error while removing role.', true);
+      }
+    });
+  }
+
   logoutBtn.addEventListener('click', async () => {
     try {
-      await fetch('/auth/logout', { method: 'POST' });
+      await fetch('/auth/logout', { method: 'POST', credentials: 'same-origin' });
       window.location.href = '/login';
     } catch (error) {
       showMessage('Network error while logging out.', true);
@@ -503,6 +847,15 @@ function initDashboardPage() {
     try {
       await checkSession();
       await refreshAll();
+      populateTeamRoles();
+      if (canManageTeam()) {
+        await loadTeamUsers();
+      }
+      if (canManageRoles()) {
+        await loadAvailableRoles();
+      }
+      switchSection(getDefaultSectionForUser());
+      applyRoleVisibility();
     } catch (error) {
       showMessage('Unable to load data. Please login again.', true);
       setTimeout(() => {
