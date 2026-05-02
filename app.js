@@ -113,6 +113,70 @@ async function getUserByUsernameAndBusiness(username, businessId) {
   return rows[0];
 }
 
+function getSessionUserId(req) {
+  return req.session.userId || req.session.user?.id || null;
+}
+
+async function logActivity(userId, actionType, entityType, entityId, description) {
+  try {
+    console.debug(`[logActivity] Called with userId: ${userId}, actionType: ${actionType}, entityType: ${entityType}, entityId: ${entityId}, description: ${description}`);
+    
+    if (!userId || !actionType || !entityType || !description) {
+      console.debug(`[logActivity] Returning early - missing required params. userId: ${userId}, actionType: ${actionType}, entityType: ${entityType}, description: ${description}`);
+      return;
+    }
+
+    const businessId = await getUserBusinessId(userId);
+    console.debug(`[logActivity] Got businessId: ${businessId} for userId: ${userId}`);
+    
+    if (!businessId) {
+      console.debug(`[logActivity] Returning early - businessId not found for userId: ${userId}`);
+      return;
+    }
+
+    try {
+      await db.execute(
+        `INSERT INTO activity_logs (user_id, action_type, entity_type, entity_id, description, business_id)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [userId, actionType, entityType, entityId || null, description, businessId]
+      );
+      console.debug(`[logActivity] Successfully logged: ${actionType} on ${entityType} id=${entityId}`);
+    } catch (insertError) {
+      if (insertError.message && insertError.message.includes("Field 'action'")) {
+        console.warn('[logActivity] Table has legacy action column, attempting migration...');
+        await migrateActivityLogsTable();
+        await db.execute(
+          `INSERT INTO activity_logs (user_id, action_type, entity_type, entity_id, description, business_id)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+          [userId, actionType, entityType, entityId || null, description, businessId]
+        );
+        console.debug(`[logActivity] Successfully logged after migration: ${actionType} on ${entityType} id=${entityId}`);
+      } else {
+        throw insertError;
+      }
+    }
+  } catch (error) {
+    console.error('Failed to write activity log:', error);
+  }
+}
+
+async function migrateActivityLogsTable() {
+  try {
+    console.log('[migrateActivityLogsTable] Checking if action column exists...');
+    const [rows] = await db.execute(
+      `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME='activity_logs' AND TABLE_SCHEMA=DATABASE() AND COLUMN_NAME='action'`
+    );
+    
+    if (rows.length > 0) {
+      console.log('[migrateActivityLogsTable] Found action column, dropping it...');
+      await db.execute(`ALTER TABLE activity_logs DROP COLUMN action`);
+      console.log('[migrateActivityLogsTable] Successfully dropped action column');
+    }
+  } catch (error) {
+    console.error('[migrateActivityLogsTable] Error during migration:', error);
+  }
+}
+
 async function ensureBusinessSchema() {
   await db.execute(`
     CREATE TABLE IF NOT EXISTS businesses (
@@ -122,6 +186,8 @@ async function ensureBusinessSchema() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
   `);
+  
+  await migrateActivityLogsTable();
 
   const columnsToEnsure = [
     ['users', 'business_id INT NULL'],
@@ -316,6 +382,14 @@ app.post('/auth/register', async (req, res) => {
       businessResult.insertId
     ]);
 
+    await logActivity(
+      result.insertId,
+      'CREATE_USER',
+      'USER',
+      result.insertId,
+      `Created user: ${username} as business admin for ${businessName.trim()}`
+    );
+
     return res.status(201).json({ message: 'User created successfully.', userId: result.insertId });
   } catch (error) {
     if (error.code === 'ER_DUP_ENTRY') {
@@ -366,6 +440,13 @@ app.post('/users', requireRole(['admin', 'manager']), async (req, res) => {
     );
 
     await assignRoleToUser(result.insertId, roleId);
+    await logActivity(
+      getSessionUserId(req),
+      'CREATE_USER',
+      'USER',
+      result.insertId,
+      `Created user: ${username} with role ${normalizedRoleName}`
+    );
     return res.status(201).json({ message: 'User created successfully.', userId: result.insertId });
   } catch (error) {
     return res.status(500).json({ message: 'Failed to create user.' });
@@ -406,6 +487,8 @@ app.post('/auth/login', async (req, res) => {
       business_name: user.business_name,
       roles: roles.map((role) => role.role_name)
     };
+    req.session.userId = user.id;
+    await logActivity(user.id, 'LOGIN', 'USER', user.id, `User ${user.username} logged in`);
     return res.json({ message: 'Login successful.' });
   } catch (error) {
     return res.status(500).json({ message: 'Login failed.' });
@@ -413,13 +496,26 @@ app.post('/auth/login', async (req, res) => {
 });
 
 app.post('/auth/logout', (req, res) => {
-  req.session.destroy((err) => {
-    if (err) {
-      return res.status(500).json({ message: 'Logout failed.' });
+  const actorUserId = getSessionUserId(req);
+  const actorUsername = req.session.user?.username || 'Unknown';
+
+  (async () => {
+    if (actorUserId) {
+      await logActivity(actorUserId, 'LOGOUT', 'USER', actorUserId, `User ${actorUsername} logged out`);
     }
-    res.clearCookie('connect.sid');
-    return res.json({ message: 'Logout successful.' });
-  });
+  })()
+    .catch((error) => {
+      console.error('Failed to log logout activity:', error);
+    })
+    .finally(() => {
+      req.session.destroy((err) => {
+        if (err) {
+          return res.status(500).json({ message: 'Logout failed.' });
+        }
+        res.clearCookie('connect.sid');
+        return res.json({ message: 'Logout successful.' });
+      });
+    });
 });
 
 app.get('/auth/session', (req, res) => {
@@ -444,10 +540,16 @@ app.get('/team/users', requireRole(['admin', 'manager']), async (req, res) => {
   try {
     const businessId = getSessionBusinessId(req);
     const [rows] = await db.execute(
-      `SELECT username
-       FROM users
-       WHERE business_id = ?
-       ORDER BY username ASC`,
+      `SELECT
+         u.id,
+         u.username,
+         COALESCE(GROUP_CONCAT(DISTINCT ur.role_name ORDER BY ur.role_name SEPARATOR ', '), 'staff') AS roles
+       FROM users u
+       LEFT JOIN user_role_assignment ura ON ura.user_id = u.id
+       LEFT JOIN user_roles ur ON ur.id = ura.role_id
+       WHERE u.business_id = ?
+       GROUP BY u.id, u.username
+       ORDER BY u.username ASC`,
       [businessId]
     );
 
@@ -482,6 +584,38 @@ app.get('/users/by-username/:username/roles', requireRole(['admin']), async (req
   }
 });
 
+app.delete('/users/by-username/:username', requireRole(['admin']), async (req, res) => {
+  try {
+    const username = String(req.params.username || '').trim();
+    if (!username) {
+      return res.status(400).json({ message: 'Invalid username.' });
+    }
+
+    const businessId = getSessionBusinessId(req);
+    const user = await getUserByUsernameAndBusiness(username, businessId);
+    if (!user) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    const [result] = await db.execute('DELETE FROM users WHERE id = ? AND business_id = ?', [user.id, businessId]);
+    if (!result.affectedRows) {
+      return res.status(404).json({ message: 'User not found.' });
+    }
+
+    await logActivity(
+      getSessionUserId(req),
+      'DELETE_USER',
+      'USER',
+      user.id,
+      `Deleted user: ${user.username}`
+    );
+
+    return res.json({ message: 'User deleted successfully.' });
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to delete user.' });
+  }
+});
+
 app.post('/users/by-username/:username/roles', requireRole(['admin']), async (req, res) => {
   try {
     const username = String(req.params.username || '').trim();
@@ -513,6 +647,13 @@ app.post('/users/by-username/:username/roles', requireRole(['admin']), async (re
 
     await assignRoleToUser(user.id, roleId);
     const roles = await getUserRoles(user.id);
+    await logActivity(
+      getSessionUserId(req),
+      'ASSIGN_ROLE',
+      'USER_ROLE',
+      user.id,
+      `Assigned role ${normalizedRoleName} to user: ${username}`
+    );
     return res.status(201).json({ message: 'Role assigned successfully.', roles });
   } catch (error) {
     return res.status(500).json({ message: 'Failed to assign role.' });
@@ -548,6 +689,17 @@ app.delete('/users/by-username/:username/roles/:roleId', requireRole(['admin']),
       return res.status(404).json({ message: 'Role assignment not found.' });
     }
 
+    const [roleRows] = await db.execute('SELECT role_name FROM user_roles WHERE id = ?', [roleId]);
+    const roleName = roleRows.length > 0 ? roleRows[0].role_name : 'Unknown';
+    
+    await logActivity(
+      getSessionUserId(req),
+      'REMOVE_ROLE',
+      'USER_ROLE',
+      user.id,
+      `Removed role ${roleName} from user: ${username}`
+    );
+
     const roles = await getUserRoles(user.id);
     return res.json({ message: 'Role removed successfully.', roles });
   } catch (error) {
@@ -581,6 +733,13 @@ app.post('/categories', requireRole(['admin', 'manager']), async (req, res) => {
       name,
       businessId
     ]);
+    await logActivity(
+      getSessionUserId(req),
+      'ADD_CATEGORY',
+      'CATEGORY',
+      result.insertId,
+      `${req.session.user?.username || 'Unknown'} added category: ${name}`
+    );
     return res.status(201).json({ message: 'Category added successfully.', categoryId: result.insertId });
   } catch (error) {
     if (error.code === 'ER_DUP_ENTRY') {
@@ -598,6 +757,11 @@ app.delete('/categories/:id', requireRole(['admin', 'manager']), async (req, res
     }
 
     const businessId = getSessionBusinessId(req);
+    const [existingRows] = await db.execute('SELECT name FROM categories WHERE id = ? AND business_id = ?', [
+      parsedId,
+      businessId
+    ]);
+    const categoryName = existingRows[0]?.name;
     const [result] = await db.execute('DELETE FROM categories WHERE id = ? AND business_id = ?', [
       parsedId,
       businessId
@@ -605,6 +769,13 @@ app.delete('/categories/:id', requireRole(['admin', 'manager']), async (req, res
     if (!result.affectedRows) {
       return res.status(404).json({ message: 'Category not found.' });
     }
+    await logActivity(
+      getSessionUserId(req),
+      'DELETE_CATEGORY',
+      'CATEGORY',
+      parsedId,
+      `${req.session.user?.username || 'Unknown'} deleted category: ${categoryName || parsedId}`
+    );
     return res.json({ message: 'Category deleted successfully.' });
   } catch (error) {
     if (error.code === 'ER_ROW_IS_REFERENCED_2') {
@@ -696,6 +867,14 @@ app.post('/products', requireRole(['admin', 'manager']), async (req, res) => {
       [name, parsedCategoryId, parsedQuantity, parsedPrice, finalExpiryDate, businessId]
     );
 
+    await logActivity(
+      getSessionUserId(req),
+      'ADD_PRODUCT',
+      'PRODUCT',
+      result.insertId,
+      `${req.session.user?.username || 'Unknown'} added product: ${name} with quantity ${parsedQuantity}`
+    );
+
     return res.status(201).json({ message: 'Product added successfully.', productId: result.insertId });
   } catch (error) {
     return res.status(500).json({ message: 'Failed to add product.' });
@@ -744,6 +923,12 @@ app.put('/products/:id', requireRole(['admin', 'manager']), async (req, res) => 
 
     const finalExpiryDate = isPerishable ? parsedExpiryDate.value : null;
 
+    const [existingRows] = await db.execute('SELECT name FROM products WHERE id = ? AND business_id = ?', [
+      parsedId,
+      businessId
+    ]);
+    const existingProductName = existingRows[0]?.name || name;
+
     const [result] = await db.execute(
       'UPDATE products SET name = ?, category_id = ?, quantity = ?, price = ?, expiry_date = ? WHERE id = ? AND business_id = ?',
       [name, parsedCategoryId, parsedQuantity, parsedPrice, finalExpiryDate, parsedId, businessId]
@@ -752,6 +937,14 @@ app.put('/products/:id', requireRole(['admin', 'manager']), async (req, res) => 
     if (!result.affectedRows) {
       return res.status(404).json({ message: 'Product not found.' });
     }
+
+    await logActivity(
+      getSessionUserId(req),
+      'UPDATE_PRODUCT',
+      'PRODUCT',
+      parsedId,
+      `${req.session.user?.username || 'Unknown'} updated product: ${existingProductName} with quantity ${parsedQuantity}`
+    );
 
     return res.json({ message: 'Product updated successfully.' });
   } catch (error) {
@@ -767,6 +960,11 @@ app.delete('/products/:id', requireRole(['admin', 'manager']), async (req, res) 
     }
 
     const businessId = getSessionBusinessId(req);
+    const [existingRows] = await db.execute('SELECT name FROM products WHERE id = ? AND business_id = ?', [
+      parsedId,
+      businessId
+    ]);
+    const productName = existingRows[0]?.name;
     const [result] = await db.execute('DELETE FROM products WHERE id = ? AND business_id = ?', [
       parsedId,
       businessId
@@ -774,6 +972,13 @@ app.delete('/products/:id', requireRole(['admin', 'manager']), async (req, res) 
     if (!result.affectedRows) {
       return res.status(404).json({ message: 'Product not found.' });
     }
+    await logActivity(
+      getSessionUserId(req),
+      'DELETE_PRODUCT',
+      'PRODUCT',
+      parsedId,
+      `${req.session.user?.username || 'Unknown'} deleted product: ${productName || parsedId}`
+    );
     return res.json({ message: 'Product deleted successfully.' });
   } catch (error) {
     return res.status(500).json({ message: 'Failed to delete product.' });
@@ -828,6 +1033,70 @@ app.get('/products/export/csv', requireAuth, async (req, res) => {
     return res.send(csv);
   } catch (error) {
     return res.status(500).json({ message: 'Failed to export CSV.' });
+  }
+});
+
+app.get('/logs', requireAuth, async (req, res) => {
+  try {
+    const businessId = getSessionBusinessId(req);
+    const currentUserId = getSessionUserId(req);
+    const isAdmin = hasAnyRole(req, ['admin']);
+    const isManager = hasAnyRole(req, ['manager']);
+    const { type = '', action = '' } = req.query;
+
+    console.debug(`[/logs] userId: ${currentUserId}, isAdmin: ${isAdmin}, isManager: ${isManager}, businessId: ${businessId}`);
+
+    let sql = `
+      SELECT
+        al.id,
+        al.user_id,
+        COALESCE(
+          (
+            SELECT GROUP_CONCAT(DISTINCT ur.role_name ORDER BY ur.role_name SEPARATOR ', ')
+            FROM user_role_assignment ura
+            INNER JOIN user_roles ur ON ur.id = ura.role_id
+            WHERE ura.user_id = al.user_id
+          ),
+          'N/A'
+        ) AS role_name,
+        al.action_type,
+        al.entity_type,
+        al.entity_id,
+        al.description,
+        al.created_at
+      FROM activity_logs al
+      WHERE al.business_id = ?
+    `;
+    const params = [businessId];
+
+    if (!isAdmin && !isManager) {
+      sql += ' AND al.user_id = ?';
+      params.push(currentUserId);
+      console.debug(`[/logs] Non-admin/manager: filtering to own logs only`);
+    } else {
+      console.debug(`[/logs] Admin/Manager: showing all business logs`);
+    }
+
+    sql += ' AND al.action_type NOT IN (?, ?)';
+    params.push('LOGIN', 'LOGOUT');
+
+    if (type) {
+      sql += ' AND al.entity_type = ?';
+      params.push(String(type).trim().toUpperCase());
+    }
+
+    if (action) {
+      sql += ' AND al.action_type = ?';
+      params.push(String(action).trim().toUpperCase());
+    }
+
+    sql += ' ORDER BY al.created_at DESC, al.id DESC';
+
+    const [rows] = await db.execute(sql, params);
+    return res.json(rows);
+  } catch (error) {
+    console.error('Failed to fetch activity logs:', error);
+    return res.status(500).json({ message: 'Failed to fetch logs.' });
   }
 });
 

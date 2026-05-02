@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS user_role_assignment (
   CREATE TABLE IF NOT EXISTS activity_logs (
     id INT AUTO_INCREMENT PRIMARY KEY,
     user_id INT NOT NULL,
-    action VARCHAR(100) NOT NULL,
+    action_type VARCHAR(50) NOT NULL,
     entity_type VARCHAR(50),
     entity_id INT,
     description TEXT,

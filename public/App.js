@@ -150,6 +150,7 @@ function initDashboardPage() {
   const loadUserRolesBtn = document.getElementById('loadUserRolesBtn');
   const userRolesBody = document.getElementById('userRolesBody');
   const teamUsernamesList = document.getElementById('teamUsernames');
+  const activityLogsBody = document.getElementById('activityLogsBody');
 
   const teamForm = document.getElementById('teamForm');
   const teamUsernameInput = document.getElementById('teamUsername');
@@ -200,6 +201,10 @@ function initDashboardPage() {
   }
 
   function canManageTeam() {
+    return hasAnyRole(['admin', 'manager']);
+  }
+
+  function canViewActivityLogs() {
     return hasAnyRole(['admin', 'manager']);
   }
 
@@ -413,6 +418,27 @@ function initDashboardPage() {
     applyRoleVisibility();
   }
 
+  function renderActivityLogs(rows) {
+    if (!activityLogsBody) return;
+
+    activityLogsBody.innerHTML = '';
+    if (!rows.length) {
+      const row = document.createElement('tr');
+      row.innerHTML = '<td colspan="3">No activity logs found.</td>';
+      activityLogsBody.appendChild(row);
+      return;
+    }
+
+    rows.forEach((logItem) => {
+      const row = document.createElement('tr');
+      row.innerHTML =
+        '<td>' + escapeHtml(logItem.role_name || '-') + '</td>' +
+        '<td>' + escapeHtml(logItem.description || '-') + '</td>' +
+        '<td>' + (logItem.created_at ? new Date(logItem.created_at).toLocaleString() : '-') + '</td>';
+      activityLogsBody.appendChild(row);
+    });
+  }
+
   async function loadUserRoles(username) {
     if (!username) {
       roleAssignmentsCache = [];
@@ -552,6 +578,23 @@ function initDashboardPage() {
     await loadCategories();
     await loadProducts();
     await loadDashboard();
+    if (canViewActivityLogs()) {
+      await loadActivityLogs();
+    }
+  }
+
+  async function loadActivityLogs() {
+    if (!activityLogsBody || !canViewActivityLogs()) return;
+
+    try {
+      const response = await fetch('/logs', { credentials: 'same-origin' });
+      if (!response.ok) throw new Error('Unable to load activity logs');
+
+      const rows = await response.json();
+      renderActivityLogs(rows);
+    } catch (error) {
+      renderActivityLogs([]);
+    }
   }
 
   navButtons.forEach((btn) => {
@@ -853,6 +896,9 @@ function initDashboardPage() {
       }
       if (canManageRoles()) {
         await loadAvailableRoles();
+      }
+      if (canViewActivityLogs()) {
+        await loadActivityLogs();
       }
       switchSection(getDefaultSectionForUser());
       applyRoleVisibility();

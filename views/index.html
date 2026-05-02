@@ -15,6 +15,7 @@
         <button class="nav-btn" data-section="productsSection">Products</button>
         <button class="nav-btn" data-section="categoriesSection">Categories</button>
         <button class="nav-btn hidden" data-section="rolesSection" data-role-only="admin,manager">Team</button>
+        <button class="nav-btn hidden" data-section="activityLogsSection" data-role-only="admin,manager">Activity Logs</button>
         <button id="logoutBtn" class="nav-btn danger">Logout</button>
       </nav>
     </aside>
@@ -87,6 +88,24 @@
               <tbody id="userRolesBody"></tbody>
             </table>
           </div>
+        </div>
+      </section>
+
+      <section id="activityLogsSection" class="panel" data-role-only="admin,manager">
+        <h3>Activity Logs</h3>
+        <p class="subtitle">Recent actions performed by you or by everyone in your business if you are an admin.</p>
+
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>Who</th>
+                <th>What</th>
+                <th>When</th>
+              </tr>
+            </thead>
+            <tbody id="activityLogsBody"></tbody>
+          </table>
         </div>
       </section>
 
@@ -232,6 +251,6 @@
     </main>
   </div>
 
-  <script src="/public/App.js?v=2"></script>
+  <script src="/public/App.js?v=4"></script>
 </body>
 </html>
