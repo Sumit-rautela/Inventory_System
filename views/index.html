@@ -22,8 +22,22 @@
 
     <main class="content">
       <header class="topbar">
-        <h1>Inventory Management System</h1>
-        <p id="welcomeText"></p>
+        <div class="topbar-wrapper">
+          <div class="topbar-title">
+            <h1>Inventory Management System</h1>
+            <p id="welcomeText"></p>
+          </div>
+          <div class="theme-toggle-wrapper">
+            <button class="theme-toggle" id="themeToggle" aria-label="Toggle Dark Mode" title="Toggle Dark Mode">
+              <div class="toggle-track">
+                <div class="toggle-thumb">
+                  <span class="toggle-icon sun-icon">☀️</span>
+                  <span class="toggle-icon moon-icon">🌙</span>
+                </div>
+              </div>
+            </button>
+          </div>
+        </div>
       </header>
 
       <section id="rolesSection" class="panel" data-role-only="admin,manager">
@@ -252,5 +266,6 @@
   </div>
 
   <script src="/public/App.js?v=4"></script>
+  <script src="/public/theme.js"></script>
 </body>
 </html>
