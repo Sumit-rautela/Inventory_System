@@ -57,8 +57,12 @@ function requireAuth(req, res, next) {
 }
 
 function toCSVValue(value) {
-  const safe = String(value ?? '').replace(/"/g, '""');
-  return `"${safe}"`;
+  if (value === undefined || value === null || value === '') {
+    return '""';
+  }
+
+  const safe = String(value).replace(/"/g, '""');
+  return `"'${safe}"`;
 }
 
 function parseDateInput(value) {
@@ -210,6 +214,10 @@ async function ensureBusinessSchema() {
     }
   }
 
+  await db.execute(
+    'UPDATE user_role_assignment SET assigned_at = CURRENT_TIMESTAMP WHERE assigned_at IS NULL'
+  );
+
   const [businessRows] = await db.execute('SELECT id FROM businesses ORDER BY id ASC LIMIT 1');
   let defaultBusinessId = businessRows[0]?.id;
 
@@ -270,10 +278,12 @@ async function getRoleIdByName(roleName) {
 }
 
 async function assignRoleToUser(userId, roleId) {
-  await db.execute('INSERT IGNORE INTO user_role_assignment (user_id, role_id) VALUES (?, ?)', [
-    userId,
-    roleId
-  ]);
+  await db.execute(
+    `INSERT INTO user_role_assignment (user_id, role_id, assigned_at)
+     VALUES (?, ?, CURRENT_TIMESTAMP)
+     ON DUPLICATE KEY UPDATE assigned_at = CURRENT_TIMESTAMP`,
+    [userId, roleId]
+  );
 }
 
 async function ensureDefaultRoleForUser(userId) {
@@ -543,12 +553,28 @@ app.get('/team/users', requireRole(['admin', 'manager']), async (req, res) => {
       `SELECT
          u.id,
          u.username,
-         COALESCE(GROUP_CONCAT(DISTINCT ur.role_name ORDER BY ur.role_name SEPARATOR ', '), 'staff') AS roles
+         COALESCE(
+           (
+             SELECT GROUP_CONCAT(DISTINCT ur.role_name ORDER BY ur.role_name SEPARATOR ', ')
+             FROM user_role_assignment ura
+             INNER JOIN user_roles ur ON ur.id = ura.role_id
+             WHERE ura.user_id = u.id
+           ),
+           'staff'
+         ) AS roles,
+         COALESCE(
+           DATE_FORMAT(
+             (
+               SELECT MAX(ura.assigned_at)
+               FROM user_role_assignment ura
+               WHERE ura.user_id = u.id
+             ),
+             '%Y-%m-%d %H:%i:%s'
+           ),
+           DATE_FORMAT(NOW(), '%Y-%m-%d %H:%i:%s')
+         ) AS assigned_at
        FROM users u
-       LEFT JOIN user_role_assignment ura ON ura.user_id = u.id
-       LEFT JOIN user_roles ur ON ur.id = ura.role_id
        WHERE u.business_id = ?
-       GROUP BY u.id, u.username
        ORDER BY u.username ASC`,
       [businessId]
     );
@@ -556,6 +582,29 @@ app.get('/team/users', requireRole(['admin', 'manager']), async (req, res) => {
     return res.json(rows);
   } catch (error) {
     return res.status(500).json({ message: 'Failed to fetch team users.' });
+  }
+});
+
+app.get('/team/role-assignments', requireRole(['admin', 'manager']), async (req, res) => {
+  try {
+    const businessId = getSessionBusinessId(req);
+    const [rows] = await db.execute(
+      `SELECT
+         u.username,
+         ur.id AS role_id,
+         ur.role_name,
+         ura.assigned_at
+       FROM users u
+       INNER JOIN user_role_assignment ura ON ura.user_id = u.id
+       INNER JOIN user_roles ur ON ur.id = ura.role_id
+       WHERE u.business_id = ?
+       ORDER BY u.username ASC, ur.role_name ASC`,
+      [businessId]
+    );
+
+    return res.json(rows);
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to fetch team role assignments.' });
   }
 });
 
@@ -1024,7 +1073,7 @@ app.get('/products/export/csv', requireAuth, async (req, res) => {
       row.quantity,
       row.price,
       row.expiry_date ? new Date(row.expiry_date).toISOString().slice(0, 10) : '',
-      new Date(row.created_at).toISOString()
+      row.created_at ? new Date(row.created_at).toISOString().slice(0, 10) : ''
     ]);
     const csv = [header, ...dataRows].map((row) => row.map(toCSVValue).join(',')).join('\n');
 

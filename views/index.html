@@ -83,8 +83,11 @@
           </form>
 
           <div class="filters compact-filters">
-            <input id="roleLookupUsername" list="teamUsernames" type="text" minlength="3" placeholder="View roles for username" />
-            <button id="loadUserRolesBtn" class="btn-secondary" type="button">Load User Roles</button>
+            <input id="roleLookupUsername" list="teamUsernames" type="text" minlength="3" placeholder="Search by username or role" />
+            <select id="roleLookupRoleFilter" disabled>
+              <option value="">All Roles</option>
+            </select>
+            <button id="exportTeamCsvBtn" class="btn-secondary" type="button">Export CSV</button>
           </div>
 
           <datalist id="teamUsernames"></datalist>
@@ -93,8 +96,8 @@
             <table>
               <thead>
                 <tr>
+                  <th>Username</th>
                   <th>Role</th>
-                  <th>Description</th>
                   <th>Assigned At</th>
                   <th>Action</th>
                 </tr>
