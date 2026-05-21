@@ -468,7 +468,7 @@ function initDashboardPage() {
           }
 
           const safeValue = String(value ?? '').replace(/"/g, '""');
-          return '"\'' + safeValue + '"';
+          return '"' + safeValue + '"';
         });
         return values.join(',');
       })

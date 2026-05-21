@@ -62,7 +62,7 @@ function toCSVValue(value) {
   }
 
   const safe = String(value).replace(/"/g, '""');
-  return `"'${safe}"`;
+  return '"' + safe + '"';
 }
 
 function parseDateInput(value) {
@@ -182,6 +182,7 @@ async function migrateActivityLogsTable() {
 }
 
 async function ensureBusinessSchema() {
+  // Create businesses table if missing
   await db.execute(`
     CREATE TABLE IF NOT EXISTS businesses (
       id INT AUTO_INCREMENT PRIMARY KEY,
@@ -190,41 +191,63 @@ async function ensureBusinessSchema() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
   `);
-  
+
+  // Ensure activity_logs is migrated first
   await migrateActivityLogsTable();
 
-  const columnsToEnsure = [
-    ['users', 'business_id INT NULL'],
-    ['categories', 'business_id INT NULL'],
-    ['products', 'business_id INT NULL'],
-    ['user_role_assignment', 'business_id INT NULL'],
-    ['activity_logs', 'business_id INT NULL'],
-    ['notifications', 'business_id INT NULL'],
-    ['product_images', 'business_id INT NULL'],
-    ['bulk_uploads', 'business_id INT NULL']
-  ];
-
-  for (const [tableName, columnDefinition] of columnsToEnsure) {
+  // Helper to safely add a column only if the table and column exist/missing
+  async function ensureColumn(tableName, columnName, columnDefinition) {
     try {
-      await db.execute(`ALTER TABLE ${tableName} ADD COLUMN ${columnDefinition}`);
-    } catch (error) {
-      if (error.code !== 'ER_DUP_FIELDNAME') {
-        throw error;
+      const [cols] = await db.execute(
+        `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = ? AND TABLE_SCHEMA = DATABASE() AND COLUMN_NAME = ?`,
+        [tableName, columnName]
+      );
+      if (cols.length === 0) {
+        await db.execute(`ALTER TABLE ${tableName} ADD COLUMN ${columnDefinition}`);
       }
+    } catch (err) {
+      // Ignore if table doesn't exist or column already exists; rethrow other errors
+      if (err && err.code && (err.code === 'ER_NO_SUCH_TABLE' || err.code === 'ER_DUP_FIELDNAME')) {
+        return;
+      }
+      throw err;
     }
   }
 
-  await db.execute(
-    'UPDATE user_role_assignment SET assigned_at = CURRENT_TIMESTAMP WHERE assigned_at IS NULL'
-  );
+  const columnsToEnsure = [
+    ['users', 'business_id', 'business_id INT NULL'],
+    ['categories', 'business_id', 'business_id INT NULL'],
+    ['products', 'business_id', 'business_id INT NULL'],
+    ['user_role_assignment', 'business_id', 'business_id INT NULL'],
+    ['activity_logs', 'business_id', 'business_id INT NULL'],
+    ['notifications', 'business_id', 'business_id INT NULL'],
+    ['product_images', 'business_id', 'business_id INT NULL'],
+    ['bulk_uploads', 'business_id', 'business_id INT NULL']
+  ];
 
-  const [businessRows] = await db.execute('SELECT id FROM businesses ORDER BY id ASC LIMIT 1');
-  let defaultBusinessId = businessRows[0]?.id;
+  for (const [tableName, columnName, columnDefinition] of columnsToEnsure) {
+    await ensureColumn(tableName, columnName, columnDefinition);
+  }
+
+  // Safe update: set assigned_at where column/table exists
+  try {
+    await db.execute('UPDATE user_role_assignment SET assigned_at = CURRENT_TIMESTAMP WHERE assigned_at IS NULL');
+  } catch (err) {
+    if (!(err && err.code === 'ER_NO_SUCH_TABLE')) throw err;
+  }
+
+  // Ensure there is at least one business row; if SELECT fails because table missing, create default
+  let defaultBusinessId = null;
+  try {
+    const [businessRows] = await db.execute('SELECT id FROM businesses ORDER BY id ASC LIMIT 1');
+    defaultBusinessId = businessRows[0]?.id;
+  } catch (err) {
+    // If selecting fails unexpectedly, rethrow
+    throw err;
+  }
 
   if (!defaultBusinessId) {
-    const [businessResult] = await db.execute('INSERT INTO businesses (name) VALUES (?)', [
-      'Default Business'
-    ]);
+    const [businessResult] = await db.execute('INSERT INTO businesses (name) VALUES (?)', ['Default Business']);
     defaultBusinessId = businessResult.insertId;
   }
 
@@ -240,18 +263,20 @@ async function ensureBusinessSchema() {
   ];
 
   for (const tableName of tablesToBackfill) {
-    await db.execute(
-      `UPDATE ${tableName} SET business_id = ? WHERE business_id IS NULL`,
-      [defaultBusinessId]
-    );
+    try {
+      await db.execute(`UPDATE ${tableName} SET business_id = ? WHERE business_id IS NULL`, [defaultBusinessId]);
+    } catch (err) {
+      if (!(err && err.code === 'ER_NO_SUCH_TABLE')) throw err;
+    }
   }
 
-  const [ownerRows] = await db.execute('SELECT id FROM users ORDER BY id ASC LIMIT 1');
-  if (ownerRows.length) {
-    await db.execute('UPDATE businesses SET owner_user_id = ? WHERE id = ?', [
-      ownerRows[0].id,
-      defaultBusinessId
-    ]);
+  try {
+    const [ownerRows] = await db.execute('SELECT id FROM users ORDER BY id ASC LIMIT 1');
+    if (ownerRows.length) {
+      await db.execute('UPDATE businesses SET owner_user_id = ? WHERE id = ?', [ownerRows[0].id, defaultBusinessId]);
+    }
+  } catch (err) {
+    if (!(err && err.code === 'ER_NO_SUCH_TABLE')) throw err;
   }
 }
 
