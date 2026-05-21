@@ -147,7 +147,8 @@ function initDashboardPage() {
   const roleUsernameInput = document.getElementById('roleUsername');
   const roleNameInput = document.getElementById('roleName');
   const roleLookupUsernameInput = document.getElementById('roleLookupUsername');
-  const loadUserRolesBtn = document.getElementById('loadUserRolesBtn');
+  const roleLookupRoleFilter = document.getElementById('roleLookupRoleFilter');
+  const exportTeamCsvBtn = document.getElementById('exportTeamCsvBtn');
   const userRolesBody = document.getElementById('userRolesBody');
   const teamUsernamesList = document.getElementById('teamUsernames');
   const activityLogsBody = document.getElementById('activityLogsBody');
@@ -175,6 +176,9 @@ function initDashboardPage() {
   let categoriesCache = [];
   let currentUser = { roles: [] };
   let roleAssignmentsCache = [];
+  let currentRoleLookupUsername = '';
+  let currentRoleLookupRoleFilter = '';
+  let teamSearchTouched = false;
 
   function showMessage(text, isError) {
     showTextMessage(globalMessage, text, !!isError);
@@ -370,13 +374,21 @@ function initDashboardPage() {
     const response = await fetch('/team/users', { credentials: 'same-origin' });
     if (!response.ok) throw new Error('Unable to load team users');
 
-    const users = await response.json();
+    const rows = await response.json();
+    roleAssignmentsCache = rows;
+    const usernames = Array.from(
+      new Set(rows.map((row) => String(row.username || '').trim()).filter(Boolean))
+    ).sort((left, right) => left.localeCompare(right));
+
     teamUsernamesList.innerHTML = '';
-    users.forEach((user) => {
+    usernames.forEach((username) => {
       const option = document.createElement('option');
-      option.value = user.username;
+      option.value = username;
       teamUsernamesList.appendChild(option);
     });
+
+    populateRoleLookupFilters(rows);
+    renderUserRoles(rows);
   }
 
   function populateTeamRoles() {
@@ -395,27 +407,124 @@ function initDashboardPage() {
   function renderUserRoles(rows) {
     if (!userRolesBody) return;
 
+    const visibleRows = getVisibleTeamRows(rows);
+
     userRolesBody.innerHTML = '';
-    if (!rows.length) {
+    if (!visibleRows.length) {
       const row = document.createElement('tr');
-      row.innerHTML = '<td colspan="4">No roles found for this user.</td>';
+      row.innerHTML = '<td colspan="4">No users found.</td>';
       userRolesBody.appendChild(row);
       return;
     }
 
-    rows.forEach((role) => {
+    visibleRows.forEach((role) => {
       const row = document.createElement('tr');
       row.innerHTML =
-        '<td>' + escapeHtml(role.role_name) + '</td>' +
-        '<td>' + escapeHtml(role.description || '-') + '</td>' +
-        '<td>' + (role.assigned_at ? new Date(role.assigned_at).toLocaleString() : '-') + '</td>' +
+        '<td>' + escapeHtml(role.username || '-') + '</td>' +
+        '<td>' + escapeHtml(role.roles || '-') + '</td>' +
+        '<td>' + formatAssignedAt(role.assigned_at) + '</td>' +
         '<td>' +
-          '<button class="btn-danger" data-remove-role="' + role.id + '">Remove</button>' +
+          '<button class="btn-danger" data-delete-user="' + encodeURIComponent(role.username || '') + '">Remove User</button>' +
         '</td>';
       userRolesBody.appendChild(row);
     });
 
     applyRoleVisibility();
+  }
+
+  function formatAssignedAt(value) {
+    if (!value) return '-';
+
+    const date = new Date(value);
+    if (!Number.isNaN(date.getTime())) {
+      return escapeHtml(date.toLocaleString());
+    }
+
+    return escapeHtml(String(value));
+  }
+
+  function getVisibleTeamRows(rows) {
+    const filteredRows = currentRoleLookupRoleFilter
+      ? rows.filter((role) => String(role.roles || '').toLowerCase().includes(currentRoleLookupRoleFilter.toLowerCase()))
+      : rows;
+
+    const searchTerm = teamSearchTouched ? currentRoleLookupUsername.trim().toLowerCase() : '';
+    if (!searchTerm) return filteredRows;
+
+    return filteredRows.filter((row) => {
+      const username = String(row.username || '').toLowerCase();
+      const roleName = String(row.roles || '').toLowerCase();
+      return username.includes(searchTerm) || roleName.includes(searchTerm);
+    });
+  }
+
+  function downloadCsv(filename, rows) {
+    const csvLines = [
+      ['Username', 'Role', 'Assigned At'].join(','),
+      ...rows.map((row) => {
+        const values = [row.username, row.roles, formatCsvDate(row.assigned_at)].map((value) => {
+          if (value === undefined || value === null || value === '') {
+            return '""';
+          }
+
+          const safeValue = String(value ?? '').replace(/"/g, '""');
+          return '"' + safeValue + '"';
+        });
+        return values.join(',');
+      })
+    ];
+
+    const blob = new Blob([csvLines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    link.style.display = 'none';
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    URL.revokeObjectURL(url);
+  }
+
+  function formatCsvDate(value) {
+    if (!value) return '';
+
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) {
+      return String(value).slice(0, 10);
+    }
+
+    return date.toISOString().slice(0, 10);
+  }
+
+  function populateRoleLookupFilters(rows) {
+    if (!roleLookupRoleFilter) return;
+
+    const uniqueRoles = Array.from(
+      new Set(
+        rows
+          .flatMap((role) => String(role.roles || '').split(',').map((value) => value.trim()))
+          .filter(Boolean)
+      )
+    ).sort((left, right) => left.localeCompare(right));
+
+    const existingFilter = currentRoleLookupRoleFilter;
+    roleLookupRoleFilter.innerHTML = '<option value="">All Roles</option>';
+    uniqueRoles.forEach((roleName) => {
+      const option = document.createElement('option');
+      option.value = roleName;
+      option.textContent = roleName;
+      roleLookupRoleFilter.appendChild(option);
+    });
+
+    if (existingFilter && uniqueRoles.includes(existingFilter)) {
+      roleLookupRoleFilter.value = existingFilter;
+    } else {
+      currentRoleLookupRoleFilter = '';
+      roleLookupRoleFilter.value = '';
+    }
+
+    roleLookupRoleFilter.disabled = uniqueRoles.length === 0;
   }
 
   function renderActivityLogs(rows) {
@@ -437,20 +546,6 @@ function initDashboardPage() {
         '<td>' + (logItem.created_at ? new Date(logItem.created_at).toLocaleString() : '-') + '</td>';
       activityLogsBody.appendChild(row);
     });
-  }
-
-  async function loadUserRoles(username) {
-    if (!username) {
-      roleAssignmentsCache = [];
-      renderUserRoles([]);
-      return;
-    }
-
-    const response = await fetch('/users/by-username/' + encodeURIComponent(username) + '/roles', { credentials: 'same-origin' });
-    if (!response.ok) throw new Error('Unable to load user roles');
-
-    roleAssignmentsCache = await response.json();
-    renderUserRoles(roleAssignmentsCache);
   }
 
   async function loadCategories() {
@@ -578,6 +673,12 @@ function initDashboardPage() {
     await loadCategories();
     await loadProducts();
     await loadDashboard();
+    if (canManageTeam()) {
+      loadTeamUsers().catch(() => {
+        roleAssignmentsCache = [];
+        renderUserRoles([]);
+      });
+    }
     if (canViewActivityLogs()) {
       await loadActivityLogs();
     }
@@ -601,19 +702,24 @@ function initDashboardPage() {
     btn.addEventListener('click', () => switchSection(btn.dataset.section));
   });
 
-  if (loadUserRolesBtn) {
-    loadUserRolesBtn.addEventListener('click', async () => {
-      const username = roleLookupUsernameInput.value.trim();
-      if (!username) {
-        return showMessage('Enter a valid username to load roles.', true);
-      }
+  if (roleLookupUsernameInput) {
+    roleLookupUsernameInput.addEventListener('input', () => {
+      teamSearchTouched = true;
+      currentRoleLookupUsername = roleLookupUsernameInput.value.trim();
+      renderUserRoles(roleAssignmentsCache);
+    });
+  }
 
-      try {
-        await loadUserRoles(username);
-        showMessage('Loaded roles for ' + username + '.', false);
-      } catch (error) {
-        showMessage('Unable to load roles for this user.', true);
-      }
+  if (roleLookupRoleFilter) {
+    roleLookupRoleFilter.addEventListener('change', () => {
+      currentRoleLookupRoleFilter = roleLookupRoleFilter.value;
+      renderUserRoles(roleAssignmentsCache);
+    });
+  }
+
+  if (exportTeamCsvBtn) {
+    exportTeamCsvBtn.addEventListener('click', () => {
+      downloadCsv('team-users.csv', getVisibleTeamRows(roleAssignmentsCache));
     });
   }
 
@@ -841,7 +947,7 @@ function initDashboardPage() {
 
         showMessage(data.message, false);
         await loadAvailableRoles();
-        await loadUserRoles(username);
+        await loadTeamUsers();
       } catch (error) {
         showMessage('Network error while assigning role.', true);
       }
@@ -850,29 +956,34 @@ function initDashboardPage() {
 
   if (userRolesBody) {
     userRolesBody.addEventListener('click', async (e) => {
-      const roleId = e.target.getAttribute('data-remove-role');
-      if (!roleId || !canManageRoles()) return;
+      const deleteUser = e.target.getAttribute('data-delete-user');
+      if (!deleteUser) return;
 
-      const username = roleLookupUsernameInput.value.trim() || roleUsernameInput.value.trim();
-      if (!username) {
-        return showMessage('Enter a username first to remove a role.', true);
+      if (!canManageRoles()) {
+        return showMessage('You do not have permission to remove users.', true);
       }
 
-      if (!window.confirm('Remove this role from the user?')) return;
+      const username = decodeURIComponent(deleteUser);
+      if (!window.confirm('Delete user "' + username + '" from the database?')) return;
 
       try {
-        const response = await fetch('/users/by-username/' + encodeURIComponent(username) + '/roles/' + roleId, {
+        const response = await fetch('/users/by-username/' + encodeURIComponent(username), {
           method: 'DELETE',
           credentials: 'same-origin'
         });
 
         const data = await response.json();
-        if (!response.ok) return showMessage(data.message || 'Failed to remove role.', true);
+        if (!response.ok) return showMessage(data.message || 'Failed to delete user.', true);
 
         showMessage(data.message, false);
-        await loadUserRoles(username);
+        if (roleLookupUsernameInput && roleLookupUsernameInput.value.trim().toLowerCase() === username.toLowerCase()) {
+          roleLookupUsernameInput.value = '';
+          currentRoleLookupUsername = '';
+          teamSearchTouched = false;
+        }
+        await loadTeamUsers();
       } catch (error) {
-        showMessage('Network error while removing role.', true);
+        showMessage('Network error while deleting user.', true);
       }
     });
   }
@@ -891,9 +1002,6 @@ function initDashboardPage() {
       await checkSession();
       await refreshAll();
       populateTeamRoles();
-      if (canManageTeam()) {
-        await loadTeamUsers();
-      }
       if (canManageRoles()) {
         await loadAvailableRoles();
       }

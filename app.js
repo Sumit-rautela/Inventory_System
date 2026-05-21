@@ -57,8 +57,12 @@ function requireAuth(req, res, next) {
 }
 
 function toCSVValue(value) {
-  const safe = String(value ?? '').replace(/"/g, '""');
-  return `"${safe}"`;
+  if (value === undefined || value === null || value === '') {
+    return '""';
+  }
+
+  const safe = String(value).replace(/"/g, '""');
+  return '"' + safe + '"';
 }
 
 function parseDateInput(value) {
@@ -178,6 +182,7 @@ async function migrateActivityLogsTable() {
 }
 
 async function ensureBusinessSchema() {
+  // Create businesses table if missing
   await db.execute(`
     CREATE TABLE IF NOT EXISTS businesses (
       id INT AUTO_INCREMENT PRIMARY KEY,
@@ -186,37 +191,63 @@ async function ensureBusinessSchema() {
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     )
   `);
-  
+
+  // Ensure activity_logs is migrated first
   await migrateActivityLogsTable();
 
-  const columnsToEnsure = [
-    ['users', 'business_id INT NULL'],
-    ['categories', 'business_id INT NULL'],
-    ['products', 'business_id INT NULL'],
-    ['user_role_assignment', 'business_id INT NULL'],
-    ['activity_logs', 'business_id INT NULL'],
-    ['notifications', 'business_id INT NULL'],
-    ['product_images', 'business_id INT NULL'],
-    ['bulk_uploads', 'business_id INT NULL']
-  ];
-
-  for (const [tableName, columnDefinition] of columnsToEnsure) {
+  // Helper to safely add a column only if the table and column exist/missing
+  async function ensureColumn(tableName, columnName, columnDefinition) {
     try {
-      await db.execute(`ALTER TABLE ${tableName} ADD COLUMN ${columnDefinition}`);
-    } catch (error) {
-      if (error.code !== 'ER_DUP_FIELDNAME') {
-        throw error;
+      const [cols] = await db.execute(
+        `SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS WHERE TABLE_NAME = ? AND TABLE_SCHEMA = DATABASE() AND COLUMN_NAME = ?`,
+        [tableName, columnName]
+      );
+      if (cols.length === 0) {
+        await db.execute(`ALTER TABLE ${tableName} ADD COLUMN ${columnDefinition}`);
       }
+    } catch (err) {
+      // Ignore if table doesn't exist or column already exists; rethrow other errors
+      if (err && err.code && (err.code === 'ER_NO_SUCH_TABLE' || err.code === 'ER_DUP_FIELDNAME')) {
+        return;
+      }
+      throw err;
     }
   }
 
-  const [businessRows] = await db.execute('SELECT id FROM businesses ORDER BY id ASC LIMIT 1');
-  let defaultBusinessId = businessRows[0]?.id;
+  const columnsToEnsure = [
+    ['users', 'business_id', 'business_id INT NULL'],
+    ['categories', 'business_id', 'business_id INT NULL'],
+    ['products', 'business_id', 'business_id INT NULL'],
+    ['user_role_assignment', 'business_id', 'business_id INT NULL'],
+    ['activity_logs', 'business_id', 'business_id INT NULL'],
+    ['notifications', 'business_id', 'business_id INT NULL'],
+    ['product_images', 'business_id', 'business_id INT NULL'],
+    ['bulk_uploads', 'business_id', 'business_id INT NULL']
+  ];
+
+  for (const [tableName, columnName, columnDefinition] of columnsToEnsure) {
+    await ensureColumn(tableName, columnName, columnDefinition);
+  }
+
+  // Safe update: set assigned_at where column/table exists
+  try {
+    await db.execute('UPDATE user_role_assignment SET assigned_at = CURRENT_TIMESTAMP WHERE assigned_at IS NULL');
+  } catch (err) {
+    if (!(err && err.code === 'ER_NO_SUCH_TABLE')) throw err;
+  }
+
+  // Ensure there is at least one business row; if SELECT fails because table missing, create default
+  let defaultBusinessId = null;
+  try {
+    const [businessRows] = await db.execute('SELECT id FROM businesses ORDER BY id ASC LIMIT 1');
+    defaultBusinessId = businessRows[0]?.id;
+  } catch (err) {
+    // If selecting fails unexpectedly, rethrow
+    throw err;
+  }
 
   if (!defaultBusinessId) {
-    const [businessResult] = await db.execute('INSERT INTO businesses (name) VALUES (?)', [
-      'Default Business'
-    ]);
+    const [businessResult] = await db.execute('INSERT INTO businesses (name) VALUES (?)', ['Default Business']);
     defaultBusinessId = businessResult.insertId;
   }
 
@@ -232,18 +263,20 @@ async function ensureBusinessSchema() {
   ];
 
   for (const tableName of tablesToBackfill) {
-    await db.execute(
-      `UPDATE ${tableName} SET business_id = ? WHERE business_id IS NULL`,
-      [defaultBusinessId]
-    );
+    try {
+      await db.execute(`UPDATE ${tableName} SET business_id = ? WHERE business_id IS NULL`, [defaultBusinessId]);
+    } catch (err) {
+      if (!(err && err.code === 'ER_NO_SUCH_TABLE')) throw err;
+    }
   }
 
-  const [ownerRows] = await db.execute('SELECT id FROM users ORDER BY id ASC LIMIT 1');
-  if (ownerRows.length) {
-    await db.execute('UPDATE businesses SET owner_user_id = ? WHERE id = ?', [
-      ownerRows[0].id,
-      defaultBusinessId
-    ]);
+  try {
+    const [ownerRows] = await db.execute('SELECT id FROM users ORDER BY id ASC LIMIT 1');
+    if (ownerRows.length) {
+      await db.execute('UPDATE businesses SET owner_user_id = ? WHERE id = ?', [ownerRows[0].id, defaultBusinessId]);
+    }
+  } catch (err) {
+    if (!(err && err.code === 'ER_NO_SUCH_TABLE')) throw err;
   }
 }
 
@@ -270,10 +303,12 @@ async function getRoleIdByName(roleName) {
 }
 
 async function assignRoleToUser(userId, roleId) {
-  await db.execute('INSERT IGNORE INTO user_role_assignment (user_id, role_id) VALUES (?, ?)', [
-    userId,
-    roleId
-  ]);
+  await db.execute(
+    `INSERT INTO user_role_assignment (user_id, role_id, assigned_at)
+     VALUES (?, ?, CURRENT_TIMESTAMP)
+     ON DUPLICATE KEY UPDATE assigned_at = CURRENT_TIMESTAMP`,
+    [userId, roleId]
+  );
 }
 
 async function ensureDefaultRoleForUser(userId) {
@@ -543,12 +578,28 @@ app.get('/team/users', requireRole(['admin', 'manager']), async (req, res) => {
       `SELECT
          u.id,
          u.username,
-         COALESCE(GROUP_CONCAT(DISTINCT ur.role_name ORDER BY ur.role_name SEPARATOR ', '), 'staff') AS roles
+         COALESCE(
+           (
+             SELECT GROUP_CONCAT(DISTINCT ur.role_name ORDER BY ur.role_name SEPARATOR ', ')
+             FROM user_role_assignment ura
+             INNER JOIN user_roles ur ON ur.id = ura.role_id
+             WHERE ura.user_id = u.id
+           ),
+           'staff'
+         ) AS roles,
+         COALESCE(
+           DATE_FORMAT(
+             (
+               SELECT MAX(ura.assigned_at)
+               FROM user_role_assignment ura
+               WHERE ura.user_id = u.id
+             ),
+             '%Y-%m-%d %H:%i:%s'
+           ),
+           DATE_FORMAT(NOW(), '%Y-%m-%d %H:%i:%s')
+         ) AS assigned_at
        FROM users u
-       LEFT JOIN user_role_assignment ura ON ura.user_id = u.id
-       LEFT JOIN user_roles ur ON ur.id = ura.role_id
        WHERE u.business_id = ?
-       GROUP BY u.id, u.username
        ORDER BY u.username ASC`,
       [businessId]
     );
@@ -556,6 +607,29 @@ app.get('/team/users', requireRole(['admin', 'manager']), async (req, res) => {
     return res.json(rows);
   } catch (error) {
     return res.status(500).json({ message: 'Failed to fetch team users.' });
+  }
+});
+
+app.get('/team/role-assignments', requireRole(['admin', 'manager']), async (req, res) => {
+  try {
+    const businessId = getSessionBusinessId(req);
+    const [rows] = await db.execute(
+      `SELECT
+         u.username,
+         ur.id AS role_id,
+         ur.role_name,
+         ura.assigned_at
+       FROM users u
+       INNER JOIN user_role_assignment ura ON ura.user_id = u.id
+       INNER JOIN user_roles ur ON ur.id = ura.role_id
+       WHERE u.business_id = ?
+       ORDER BY u.username ASC, ur.role_name ASC`,
+      [businessId]
+    );
+
+    return res.json(rows);
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to fetch team role assignments.' });
   }
 });
 
@@ -1024,7 +1098,7 @@ app.get('/products/export/csv', requireAuth, async (req, res) => {
       row.quantity,
       row.price,
       row.expiry_date ? new Date(row.expiry_date).toISOString().slice(0, 10) : '',
-      new Date(row.created_at).toISOString()
+      row.created_at ? new Date(row.created_at).toISOString().slice(0, 10) : ''
     ]);
     const csv = [header, ...dataRows].map((row) => row.map(toCSVValue).join(',')).join('\n');
 
