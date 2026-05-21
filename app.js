@@ -1,8 +1,10 @@
 const express = require('express');
+const crypto = require('crypto');
 const path = require('path');
 const session = require('express-session');
 const bcrypt = require('bcrypt');
 const mysql = require('mysql2/promise');
+const MySQLStore = require('express-mysql-session')(session);
 require('dotenv').config({ path: path.join(__dirname, '.env') });
 
 const app = express();
@@ -23,11 +25,55 @@ const db = mysql.createPool({
   queueLimit: 0
 });
 
+const sessionStore = new MySQLStore(
+  {
+    clearExpired: true,
+    checkExpirationInterval: 1000 * 60 * 15,
+    expiration: 1000 * 60 * 60 * 4,
+    createDatabaseTable: true,
+    endConnectionOnClose: false
+  },
+  db
+);
+
+function getSessionCsrfToken(req) {
+  if (!req.session.csrfToken) {
+    req.session.csrfToken = crypto.randomBytes(32).toString('hex');
+  }
+
+  return req.session.csrfToken;
+}
+
+function requireCsrfToken(req, res, next) {
+  if (['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
+    return next();
+  }
+
+  if (!req.session || !req.session.csrfToken) {
+    return res.status(403).json({ message: 'Invalid or missing CSRF token.' });
+  }
+
+  const providedToken = String(req.headers['x-csrf-token'] || req.headers['csrf-token'] || '');
+  if (!providedToken || providedToken.length !== req.session.csrfToken.length) {
+    return res.status(403).json({ message: 'Invalid or missing CSRF token.' });
+  }
+
+  const sessionTokenBuffer = Buffer.from(req.session.csrfToken);
+  const providedTokenBuffer = Buffer.from(providedToken);
+
+  if (!crypto.timingSafeEqual(sessionTokenBuffer, providedTokenBuffer)) {
+    return res.status(403).json({ message: 'Invalid or missing CSRF token.' });
+  }
+
+  return next();
+}
+
 app.use(express.json());
 
 app.use(
   session({
     secret: SESSION_SECRET,
+    store: sessionStore,
     resave: false,
     saveUninitialized: false,
     cookie: {
@@ -38,6 +84,7 @@ app.use(
     }
   })
 );
+app.use(requireCsrfToken);
 
 app.use('/public', express.static(path.join(__dirname, 'public')));
 
@@ -373,6 +420,10 @@ app.get('/login', (req, res) => {
 
 app.get('/', requireAuth, (req, res) => {
   return res.sendFile(path.join(__dirname, 'views', 'index.html'));
+});
+
+app.get('/auth/csrf', (req, res) => {
+  return res.json({ csrfToken: getSessionCsrfToken(req) });
 });
 
 // Auth
@@ -1242,6 +1293,7 @@ app.use((error, req, res, next) => {
 const PORT = Number(process.env.PORT || 3000);
 ensureBusinessSchema()
   .then(() => ensureProductsExpiryColumn())
+  .then(() => sessionStore.onReady())
   .then(() => {
     app.listen(PORT, () => {
       console.log(`Server running at http://localhost:${PORT}`);
