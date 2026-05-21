@@ -13,6 +13,51 @@ function escapeHtml(value) {
     .replace(/'/g, '&#39;');
 }
 
+let csrfToken = '';
+let csrfTokenPromise = null;
+
+async function ensureCsrfToken() {
+  if (csrfToken) return csrfToken;
+
+  if (!csrfTokenPromise) {
+    csrfTokenPromise = fetch('/auth/csrf', { credentials: 'same-origin' })
+      .then(async (response) => {
+        if (!response.ok) {
+          throw new Error('Unable to load CSRF token');
+        }
+
+        const data = await response.json();
+        if (!data.csrfToken) {
+          throw new Error('CSRF token was not returned by the server');
+        }
+
+        csrfToken = data.csrfToken;
+        return csrfToken;
+      })
+      .finally(() => {
+        csrfTokenPromise = null;
+      });
+  }
+
+  return csrfTokenPromise;
+}
+
+async function fetchWithCsrf(url, options = {}) {
+  const method = String(options.method || 'GET').toUpperCase();
+  const headers = new Headers(options.headers || {});
+
+  if (!['GET', 'HEAD', 'OPTIONS'].includes(method)) {
+    await ensureCsrfToken();
+    headers.set('x-csrf-token', csrfToken);
+  }
+
+  return fetch(url, {
+    ...options,
+    credentials: 'same-origin',
+    headers
+  });
+}
+
 function initPasswordToggles() {
   const buttons = document.querySelectorAll('.password-toggle[data-target]');
   buttons.forEach((button) => {
@@ -37,6 +82,7 @@ function initLoginPage() {
 
   if (!loginForm || !registerForm) return;
   initPasswordToggles();
+  ensureCsrfToken().catch(() => {});
 
   function showLogin() {
     loginForm.classList.remove('hidden');
@@ -68,9 +114,8 @@ function initLoginPage() {
     }
 
     try {
-      const response = await fetch('/auth/login', {
+      const response = await fetchWithCsrf('/auth/login', {
         method: 'POST',
-        credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username, password })
       });
@@ -98,9 +143,8 @@ function initLoginPage() {
     }
 
     try {
-      const response = await fetch('/auth/register', {
+      const response = await fetchWithCsrf('/auth/register', {
         method: 'POST',
-        credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ username, password, businessName })
       });
@@ -170,6 +214,8 @@ function initDashboardPage() {
   const logoutBtn = document.getElementById('logoutBtn');
 
   if (!productForm || !logoutBtn) return;
+
+  ensureCsrfToken().catch(() => {});
 
   let currentSearch = '';
   let currentCategoryFilter = '';
@@ -670,9 +716,11 @@ function initDashboardPage() {
   }
 
   async function refreshAll() {
-    await loadCategories();
-    await loadProducts();
-    await loadDashboard();
+    await Promise.all([
+      loadCategories(),
+      loadProducts(),
+      loadDashboard()
+    ]);
     if (canManageTeam()) {
       loadTeamUsers().catch(() => {
         roleAssignmentsCache = [];
@@ -740,9 +788,8 @@ function initDashboardPage() {
       }
 
       try {
-        const response = await fetch('/users', {
+        const response = await fetchWithCsrf('/users', {
           method: 'POST',
-          credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ username, password, roleName })
         });
@@ -786,9 +833,8 @@ function initDashboardPage() {
     const id = productIdInput.value;
 
     try {
-      const response = await fetch(id ? '/products/' + id : '/products', {
+      const response = await fetchWithCsrf(id ? '/products/' + id : '/products', {
         method: id ? 'PUT' : 'POST',
-        credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
@@ -838,7 +884,7 @@ function initDashboardPage() {
       if (!window.confirm('Delete this product?')) return;
 
       try {
-        const response = await fetch('/products/' + deleteId, { method: 'DELETE', credentials: 'same-origin' });
+        const response = await fetchWithCsrf('/products/' + deleteId, { method: 'DELETE' });
         const data = await response.json();
         if (!response.ok) return showMessage(data.message || 'Failed to delete product.', true);
 
@@ -881,9 +927,8 @@ function initDashboardPage() {
     if (!name) return showMessage('Category name is required.', true);
 
     try {
-      const response = await fetch('/categories', {
+      const response = await fetchWithCsrf('/categories', {
         method: 'POST',
-        credentials: 'same-origin',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name })
       });
@@ -909,7 +954,7 @@ function initDashboardPage() {
     if (!window.confirm('Delete this category?')) return;
 
     try {
-      const response = await fetch('/categories/' + categoryId, { method: 'DELETE', credentials: 'same-origin' });
+      const response = await fetchWithCsrf('/categories/' + categoryId, { method: 'DELETE' });
       const data = await response.json();
       if (!response.ok) return showMessage(data.message || 'Failed to delete category.', true);
 
@@ -935,9 +980,8 @@ function initDashboardPage() {
       }
 
       try {
-        const response = await fetch('/users/by-username/' + encodeURIComponent(username) + '/roles', {
+        const response = await fetchWithCsrf('/users/by-username/' + encodeURIComponent(username) + '/roles', {
           method: 'POST',
-          credentials: 'same-origin',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ roleName })
         });
@@ -967,9 +1011,8 @@ function initDashboardPage() {
       if (!window.confirm('Delete user "' + username + '" from the database?')) return;
 
       try {
-        const response = await fetch('/users/by-username/' + encodeURIComponent(username), {
+        const response = await fetchWithCsrf('/users/by-username/' + encodeURIComponent(username), {
           method: 'DELETE',
-          credentials: 'same-origin'
         });
 
         const data = await response.json();
@@ -990,7 +1033,7 @@ function initDashboardPage() {
 
   logoutBtn.addEventListener('click', async () => {
     try {
-      await fetch('/auth/logout', { method: 'POST', credentials: 'same-origin' });
+      await fetchWithCsrf('/auth/logout', { method: 'POST' });
       window.location.href = '/login';
     } catch (error) {
       showMessage('Network error while logging out.', true);
@@ -1004,9 +1047,6 @@ function initDashboardPage() {
       populateTeamRoles();
       if (canManageRoles()) {
         await loadAvailableRoles();
-      }
-      if (canViewActivityLogs()) {
-        await loadActivityLogs();
       }
       switchSection(getDefaultSectionForUser());
       applyRoleVisibility();
