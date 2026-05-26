@@ -202,6 +202,9 @@ function initDashboardPage() {
   const roleRestrictedElements = document.querySelectorAll('[data-role-only]');
   const globalMessage = document.getElementById('globalMessage');
   const welcomeText = document.getElementById('welcomeText');
+  const notificationOverlay = document.getElementById('notificationOverlay');
+  const notificationList = document.getElementById('notificationList');
+  const closeNotificationBtn = document.getElementById('closeNotificationBtn');
 
   const productForm = document.getElementById('productForm');
   const productIdInput = document.getElementById('productId');
@@ -259,8 +262,66 @@ function initDashboardPage() {
   let currentRoleLookupRoleFilter = '';
   let teamSearchTouched = false;
 
+  if (closeNotificationBtn) {
+    closeNotificationBtn.addEventListener('click', hideNotificationPopup);
+  }
+
+  if (notificationOverlay) {
+    notificationOverlay.addEventListener('click', (e) => {
+      if (e.target === notificationOverlay) {
+        hideNotificationPopup();
+      }
+    });
+  }
+
   function showMessage(text, isError) {
     showTextMessage(globalMessage, text, !!isError);
+  }
+
+  function hideNotificationPopup() {
+    if (!notificationOverlay) return;
+
+    notificationOverlay.classList.add('hidden');
+    notificationOverlay.setAttribute('aria-hidden', 'true');
+  }
+
+  function showNotificationPopup(notifications) {
+    if (!notificationOverlay || !notificationList) return;
+
+    if (!notifications.length) {
+      hideNotificationPopup();
+      notificationList.innerHTML = '';
+      return;
+    }
+
+    notificationList.innerHTML = notifications
+      .map((notification) => {
+        const kind = notification.message.includes('expiring soon') ? 'warning' : 'low-stock';
+        return '<div class="notification-item ' + kind + '">' +
+          '<strong>' + escapeHtml(notification.title || 'Inventory alert') + '</strong>' +
+          '<p>' + escapeHtml(notification.message || '') + '</p>' +
+        '</div>';
+      })
+      .join('');
+
+    notificationOverlay.classList.remove('hidden');
+    notificationOverlay.setAttribute('aria-hidden', 'false');
+  }
+
+  async function loadInventoryNotifications() {
+    try {
+      const response = await fetch('/notifications/inventory-alerts', { credentials: 'same-origin' });
+      if (!response.ok) return;
+
+      const notifications = await response.json();
+      showNotificationPopup(notifications);
+
+      if (notifications.length) {
+        await fetchWithCsrf('/notifications/inventory-alerts/read', { method: 'POST' });
+      }
+    } catch (error) {
+      hideNotificationPopup();
+    }
   }
 
   function getUserRoles() {
@@ -1087,6 +1148,7 @@ function initDashboardPage() {
     try {
       await checkSession();
       await refreshAll();
+      await loadInventoryNotifications();
       populateTeamRoles();
       if (canManageRoles()) {
         await loadAvailableRoles();
