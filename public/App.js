@@ -79,10 +79,42 @@ function initLoginPage() {
   const showLoginBtn = document.getElementById('showLoginBtn');
   const showRegisterBtn = document.getElementById('showRegisterBtn');
   const authMessage = document.getElementById('authMessage');
+  const loginBusinessName = document.getElementById('loginBusinessName');
 
   if (!loginForm || !registerForm) return;
   initPasswordToggles();
   ensureCsrfToken().catch(() => {});
+
+  async function loadBusinesses() {
+    if (!loginBusinessName) return;
+
+    try {
+      const response = await fetch('/auth/businesses', { credentials: 'same-origin' });
+      if (!response.ok) throw new Error('Unable to load businesses');
+
+      const businesses = await response.json();
+      loginBusinessName.innerHTML = '<option value="">Select your business</option>';
+      businesses.forEach((business) => {
+        const option = document.createElement('option');
+        option.value = business.name;
+        option.textContent = business.name;
+        loginBusinessName.appendChild(option);
+      });
+
+      if (!businesses.length) {
+        const option = document.createElement('option');
+        option.value = '';
+        option.textContent = 'No businesses available';
+        option.disabled = true;
+        loginBusinessName.appendChild(option);
+      }
+    } catch (error) {
+      loginBusinessName.innerHTML = '<option value="">Unable to load businesses</option>';
+      loginBusinessName.disabled = true;
+    }
+  }
+
+  loadBusinesses().catch(() => {});
 
   function showLogin() {
     loginForm.classList.remove('hidden');
@@ -107,17 +139,18 @@ function initLoginPage() {
     e.preventDefault();
 
     const username = document.getElementById('loginUsername').value.trim();
+    const businessName = loginBusinessName ? loginBusinessName.value.trim() : '';
     const password = document.getElementById('loginPassword').value.trim();
 
-    if (username.length < 3 || password.length < 6) {
-      return showTextMessage(authMessage, 'Please enter a valid username and password.', true);
+    if (username.length < 3 || businessName.length < 2 || password.length < 6) {
+      return showTextMessage(authMessage, 'Please enter a valid username, business name, and password.', true);
     }
 
     try {
       const response = await fetchWithCsrf('/auth/login', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ username, password })
+        body: JSON.stringify({ username, businessName, password })
       });
 
       const data = await response.json();
@@ -125,7 +158,7 @@ function initLoginPage() {
         return showTextMessage(authMessage, data.message || 'Login failed.', true);
       }
 
-      window.location.href = '/';
+      window.location.href = '/app';
     } catch (error) {
       showTextMessage(authMessage, 'Network error while logging in.', true);
     }
@@ -454,6 +487,7 @@ function initDashboardPage() {
     if (!userRolesBody) return;
 
     const visibleRows = getVisibleTeamRows(rows);
+    const adminUserCount = rows.filter((row) => hasAdminRole(row)).length;
 
     userRolesBody.innerHTML = '';
     if (!visibleRows.length) {
@@ -464,14 +498,16 @@ function initDashboardPage() {
     }
 
     visibleRows.forEach((role) => {
+      const isProtectedUser = String(role.is_owner) === '1' || (hasAdminRole(role) && adminUserCount <= 1);
+      const actionCell = isProtectedUser
+        ? '<button class="btn-danger" type="button" disabled title="This admin account cannot be removed.">Protected</button>'
+        : '<button class="btn-danger" data-delete-user="' + encodeURIComponent(role.username || '') + '">Remove User</button>';
       const row = document.createElement('tr');
       row.innerHTML =
         '<td>' + escapeHtml(role.username || '-') + '</td>' +
         '<td>' + escapeHtml(role.roles || '-') + '</td>' +
         '<td>' + formatAssignedAt(role.assigned_at) + '</td>' +
-        '<td>' +
-          '<button class="btn-danger" data-delete-user="' + encodeURIComponent(role.username || '') + '">Remove User</button>' +
-        '</td>';
+        '<td>' + actionCell + '</td>';
       userRolesBody.appendChild(row);
     });
 
@@ -502,6 +538,13 @@ function initDashboardPage() {
       const roleName = String(row.roles || '').toLowerCase();
       return username.includes(searchTerm) || roleName.includes(searchTerm);
     });
+  }
+
+  function hasAdminRole(row) {
+    return String(row?.roles || '')
+      .split(',')
+      .map((role) => role.trim().toLowerCase())
+      .includes('admin');
   }
 
   function downloadCsv(filename, rows) {
