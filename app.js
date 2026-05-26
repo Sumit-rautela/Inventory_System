@@ -349,6 +349,28 @@ async function getRoleIdByName(roleName) {
   return rows[0].id;
 }
 
+async function getBusinessOwnerUserId(businessId) {
+  const [rows] = await db.execute('SELECT owner_user_id FROM businesses WHERE id = ?', [businessId]);
+  if (!rows.length) {
+    return null;
+  }
+
+  return rows[0].owner_user_id || null;
+}
+
+async function getBusinessAdminCount(businessId) {
+  const [rows] = await db.execute(
+    `SELECT COUNT(DISTINCT u.id) AS admin_count
+     FROM users u
+     INNER JOIN user_role_assignment ura ON ura.user_id = u.id
+     INNER JOIN user_roles ur ON ur.id = ura.role_id
+     WHERE u.business_id = ? AND ur.role_name = 'admin'`,
+    [businessId]
+  );
+
+  return Number(rows[0]?.admin_count || 0);
+}
+
 async function assignRoleToUser(userId, roleId) {
   await db.execute(
     `INSERT INTO user_role_assignment (user_id, role_id, assigned_at)
@@ -371,6 +393,31 @@ async function ensureDefaultRoleForUser(userId) {
 
   await assignRoleToUser(userId, staffRoleId);
   return getUserRoles(userId);
+}
+
+async function getSessionUserPayload(userId) {
+  const [rows] = await db.execute(
+    `SELECT u.id, u.username, u.business_id, b.name AS business_name
+     FROM users u
+     LEFT JOIN businesses b ON b.id = u.business_id
+     WHERE u.id = ?`,
+    [userId]
+  );
+
+  if (!rows.length) {
+    return null;
+  }
+
+  const roles = await getUserRoles(userId);
+  const user = rows[0];
+
+  return {
+    id: user.id,
+    username: user.username,
+    business_id: user.business_id,
+    business_name: user.business_name,
+    roles: roles.map((role) => role.role_name)
+  };
 }
 
 function getSessionBusinessId(req) {
@@ -412,18 +459,31 @@ async function ensureProductsExpiryColumn() {
 
 // Pages
 app.get('/login', (req, res) => {
-  if (req.session.user) {
-    return res.redirect('/');
-  }
   return res.sendFile(path.join(__dirname, 'views', 'login.html'));
 });
 
-app.get('/', requireAuth, (req, res) => {
+app.get('/', (req, res) => {
+  return res.redirect('/login');
+});
+
+app.get('/app', requireAuth, (req, res) => {
   return res.sendFile(path.join(__dirname, 'views', 'index.html'));
 });
 
 app.get('/auth/csrf', (req, res) => {
   return res.json({ csrfToken: getSessionCsrfToken(req) });
+});
+
+app.get('/auth/businesses', async (req, res) => {
+  try {
+    const [rows] = await db.execute(
+      'SELECT id, name FROM businesses ORDER BY name ASC'
+    );
+
+    return res.json(rows);
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to load businesses.' });
+  }
 });
 
 // Auth
@@ -441,11 +501,6 @@ app.post('/auth/register', async (req, res) => {
 
     if (password.length < 6) {
       return res.status(400).json({ message: 'Password must be at least 6 characters.' });
-    }
-
-    const [existing] = await db.execute('SELECT id FROM users WHERE username = ?', [username]);
-    if (existing.length > 0) {
-      return res.status(409).json({ message: 'Username already exists.' });
     }
 
     const hashedPassword = await bcrypt.hash(password, 10);
@@ -509,9 +564,12 @@ app.post('/users', requireRole(['admin', 'manager']), async (req, res) => {
       return res.status(400).json({ message: 'Admins can only create manager or staff users.' });
     }
 
-    const [existing] = await db.execute('SELECT id FROM users WHERE username = ?', [username]);
+    const [existing] = await db.execute(
+      'SELECT id FROM users WHERE username = ? AND business_id = ?',
+      [username, currentBusinessId]
+    );
     if (existing.length > 0) {
-      return res.status(409).json({ message: 'Username already exists.' });
+      return res.status(409).json({ message: 'Username already exists in this business.' });
     }
 
     const roleId = await getRoleIdByName(normalizedRoleName);
@@ -541,18 +599,18 @@ app.post('/users', requireRole(['admin', 'manager']), async (req, res) => {
 
 app.post('/auth/login', async (req, res) => {
   try {
-    const { username, password } = req.body;
+    const { username, password, businessName } = req.body;
 
-    if (!username || !password) {
-      return res.status(400).json({ message: 'Username and password are required.' });
+    if (!username || !password || !businessName) {
+      return res.status(400).json({ message: 'Username, business name, and password are required.' });
     }
 
     const [rows] = await db.execute(
       `SELECT u.id, u.username, u.password, u.business_id, b.name AS business_name
        FROM users u
        LEFT JOIN businesses b ON b.id = u.business_id
-       WHERE u.username = ?`,
-      [username]
+       WHERE u.username = ? AND LOWER(b.name) = LOWER(?)`,
+      [username, businessName.trim()]
     );
     if (rows.length === 0) {
       return res.status(401).json({ message: 'Invalid credentials.' });
@@ -605,10 +663,22 @@ app.post('/auth/logout', (req, res) => {
 });
 
 app.get('/auth/session', (req, res) => {
-  if (!req.session.user) {
+  if (!req.session.user || !getSessionUserId(req)) {
     return res.status(401).json({ authenticated: false });
   }
-  return res.json({ authenticated: true, user: req.session.user });
+
+  getSessionUserPayload(getSessionUserId(req))
+    .then((user) => {
+      if (!user) {
+        return res.status(401).json({ authenticated: false });
+      }
+
+      req.session.user = user;
+      return res.json({ authenticated: true, user });
+    })
+    .catch(() => {
+      return res.status(500).json({ authenticated: false, message: 'Failed to load session.' });
+    });
 });
 
 app.get('/roles', requireRole(['admin']), async (req, res) => {
@@ -629,6 +699,7 @@ app.get('/team/users', requireRole(['admin', 'manager']), async (req, res) => {
       `SELECT
          u.id,
          u.username,
+         CASE WHEN u.id = b.owner_user_id THEN 1 ELSE 0 END AS is_owner,
          COALESCE(
            (
              SELECT GROUP_CONCAT(DISTINCT ur.role_name ORDER BY ur.role_name SEPARATOR ', ')
@@ -650,6 +721,7 @@ app.get('/team/users', requireRole(['admin', 'manager']), async (req, res) => {
            DATE_FORMAT(NOW(), '%Y-%m-%d %H:%i:%s')
          ) AS assigned_at
        FROM users u
+       LEFT JOIN businesses b ON b.id = u.business_id
        WHERE u.business_id = ?
        ORDER BY u.username ASC`,
       [businessId]
@@ -720,6 +792,20 @@ app.delete('/users/by-username/:username', requireRole(['admin']), async (req, r
     const user = await getUserByUsernameAndBusiness(username, businessId);
     if (!user) {
       return res.status(404).json({ message: 'User not found.' });
+    }
+
+    const ownerUserId = await getBusinessOwnerUserId(businessId);
+    if (String(ownerUserId) === String(user.id)) {
+      return res.status(403).json({ message: 'Cannot delete the business owner account.' });
+    }
+
+    const userRoles = await getUserRoles(user.id);
+    const isAdminUser = userRoles.some((role) => role.role_name === 'admin');
+    if (isAdminUser) {
+      const adminCount = await getBusinessAdminCount(businessId);
+      if (adminCount <= 1) {
+        return res.status(403).json({ message: 'Cannot delete the last admin in the business.' });
+      }
     }
 
     const [result] = await db.execute('DELETE FROM users WHERE id = ? AND business_id = ?', [user.id, businessId]);
@@ -800,6 +886,20 @@ app.delete('/users/by-username/:username/roles/:roleId', requireRole(['admin']),
       return res.status(404).json({ message: 'User not found.' });
     }
 
+    const [roleRows] = await db.execute('SELECT role_name FROM user_roles WHERE id = ?', [roleId]);
+    const roleName = roleRows.length > 0 ? roleRows[0].role_name : null;
+    if (roleName === 'admin') {
+      const ownerUserId = await getBusinessOwnerUserId(currentBusinessId);
+      if (String(ownerUserId) === String(user.id)) {
+        return res.status(403).json({ message: 'Cannot remove admin access from the business owner account.' });
+      }
+
+      const adminCount = await getBusinessAdminCount(currentBusinessId);
+      if (adminCount <= 1) {
+        return res.status(403).json({ message: 'Cannot remove the last admin from the business.' });
+      }
+    }
+
     const userBusinessId = user.business_id;
     if (String(userBusinessId) !== String(currentBusinessId)) {
       return res.status(403).json({ message: 'Forbidden. Cross-business access is not allowed.' });
@@ -814,15 +914,14 @@ app.delete('/users/by-username/:username/roles/:roleId', requireRole(['admin']),
       return res.status(404).json({ message: 'Role assignment not found.' });
     }
 
-    const [roleRows] = await db.execute('SELECT role_name FROM user_roles WHERE id = ?', [roleId]);
-    const roleName = roleRows.length > 0 ? roleRows[0].role_name : 'Unknown';
+    const safeRoleName = roleName || 'Unknown';
     
     await logActivity(
       getSessionUserId(req),
       'REMOVE_ROLE',
       'USER_ROLE',
       user.id,
-      `Removed role ${roleName} from user: ${username}`
+      `Removed role ${safeRoleName} from user: ${username}`
     );
 
     const roles = await getUserRoles(user.id);

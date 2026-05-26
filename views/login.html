@@ -28,6 +28,11 @@
         <label for="loginUsername">Username</label>
         <input id="loginUsername" name="username" type="text" required minlength="3" />
 
+        <label for="loginBusinessName">Business Name</label>
+        <select id="loginBusinessName" name="businessName" required>
+          <option value="">Loading businesses...</option>
+        </select>
+
         <label for="loginPassword">Password</label>
         <div class="password-wrap">
           <input id="loginPassword" name="password" type="password" required minlength="6" />
@@ -57,7 +62,7 @@
     </div>
   </div>
 
-  <script src="/public/App.js?v=2"></script>
+  <script src="/public/App.js?v=4"></script>
   <script src="/public/theme.js"></script>
 </body>
 </html>
