@@ -158,6 +158,67 @@ select {
   font-weight: 500;
 }
 
+.notification-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(14, 23, 34, 0.42);
+  display: grid;
+  place-items: center;
+  padding: 20px;
+  z-index: 1000;
+}
+
+.notification-modal {
+  width: min(620px, 100%);
+  max-height: min(80vh, 760px);
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 18px;
+  box-shadow: var(--shadow);
+  padding: 20px;
+}
+
+.notification-modal-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+  margin-bottom: 16px;
+}
+
+.notification-list {
+  display: grid;
+  gap: 12px;
+}
+
+.notification-item {
+  border-radius: 12px;
+  padding: 14px;
+  border: 1px solid var(--border);
+  background: #f8fbfd;
+}
+
+.notification-item.warning {
+  background: #fff7ed;
+  border-color: #fed7aa;
+}
+
+.notification-item.low-stock {
+  background: #eefaf7;
+  border-color: #bfe8df;
+}
+
+.notification-item strong {
+  display: block;
+  margin-bottom: 4px;
+}
+
+.notification-item p {
+  margin: 0;
+  color: var(--muted);
+}
+
 .layout {
   min-height: 100vh;
   display: grid;

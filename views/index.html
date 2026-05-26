@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Inventory Dashboard</title>
+  <title>Inventory System</title>
   <link rel="stylesheet" href="/public/style.css" />
 </head>
 <body>
@@ -21,6 +21,19 @@
     </aside>
 
     <main class="content">
+      <div id="notificationOverlay" class="notification-overlay hidden" aria-hidden="true">
+        <div class="notification-modal" role="dialog" aria-modal="true" aria-labelledby="notificationTitle">
+          <div class="notification-modal-header">
+            <div>
+              <h2 id="notificationTitle">Inventory Alerts</h2>
+              <p class="subtitle">Products that need attention for this business.</p>
+            </div>
+            <button id="closeNotificationBtn" class="btn-secondary" type="button">Close</button>
+          </div>
+          <div id="notificationList" class="notification-list"></div>
+        </div>
+      </div>
+
       <header class="topbar">
         <div class="topbar-wrapper">
           <div class="topbar-title">
@@ -268,7 +281,7 @@
     </main>
   </div>
 
-  <script src="/public/App.js?v=4"></script>
+  <script src="/public/App.js?v=5"></script>
   <script src="/public/theme.js"></script>
 </body>
 </html>

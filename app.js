@@ -420,6 +420,88 @@ async function getSessionUserPayload(userId) {
   };
 }
 
+async function getInventoryAlertProducts(businessId) {
+  const [lowStockRows] = await db.execute(
+    `SELECT p.id, p.name, p.quantity, p.expiry_date, c.name AS category_name
+     FROM products p
+     LEFT JOIN categories c ON c.id = p.category_id AND c.business_id = p.business_id
+     WHERE p.business_id = ? AND p.quantity < 10
+     ORDER BY p.quantity ASC, p.name ASC`,
+    [businessId]
+  );
+
+  const [expiringRows] = await db.execute(
+    `SELECT p.id, p.name, p.quantity, p.expiry_date, c.name AS category_name
+     FROM products p
+     LEFT JOIN categories c ON c.id = p.category_id AND c.business_id = p.business_id
+     WHERE p.business_id = ?
+       AND p.expiry_date IS NOT NULL
+       AND DATEDIFF(p.expiry_date, CURDATE()) BETWEEN 0 AND 7
+     ORDER BY p.expiry_date ASC, p.name ASC`,
+    [businessId]
+  );
+
+  const alertsByProductId = new Map();
+
+  for (const product of lowStockRows) {
+    alertsByProductId.set(String(product.id), {
+      product,
+      lowStock: true,
+      expiringSoon: false
+    });
+  }
+
+  for (const product of expiringRows) {
+    const key = String(product.id);
+    const existing = alertsByProductId.get(key) || {
+      product,
+      lowStock: false,
+      expiringSoon: false
+    };
+
+    existing.product = product;
+    existing.expiringSoon = true;
+    alertsByProductId.set(key, existing);
+  }
+
+  return Array.from(alertsByProductId.values()).map(({ product, lowStock, expiringSoon }) => {
+    const reasons = [];
+    if (lowStock) {
+      reasons.push(`low in stock (${product.quantity} left)`);
+    }
+    if (expiringSoon && product.expiry_date) {
+      reasons.push(`expiring soon on ${new Date(product.expiry_date).toISOString().slice(0, 10)}`);
+    }
+
+    const categorySuffix = product.category_name ? ` in ${product.category_name}` : '';
+
+    return {
+      title: 'Inventory alert',
+      message: `${product.name}${categorySuffix} is ${reasons.join(' and ')}.`,
+      type: 'INVENTORY_ALERT'
+    };
+  });
+}
+
+async function syncInventoryNotificationsForUser(userId, businessId) {
+  const alerts = await getInventoryAlertProducts(businessId);
+
+  await db.execute(
+    `DELETE FROM notifications WHERE user_id = ? AND business_id = ? AND type = 'INVENTORY_ALERT'`,
+    [userId, businessId]
+  );
+
+  for (const alert of alerts) {
+    await db.execute(
+      `INSERT INTO notifications (user_id, title, message, type, business_id, is_read)
+       VALUES (?, ?, ?, ?, ?, 0)`,
+      [userId, alert.title, alert.message, alert.type, businessId]
+    );
+  }
+
+  return alerts;
+}
+
 function getSessionBusinessId(req) {
   return req.session.user?.business_id || null;
 }
@@ -632,6 +714,7 @@ app.post('/auth/login', async (req, res) => {
       roles: roles.map((role) => role.role_name)
     };
     req.session.userId = user.id;
+    await syncInventoryNotificationsForUser(user.id, user.business_id);
     await logActivity(user.id, 'LOGIN', 'USER', user.id, `User ${user.username} logged in`);
     return res.json({ message: 'Login successful.' });
   } catch (error) {
@@ -679,6 +762,51 @@ app.get('/auth/session', (req, res) => {
     .catch(() => {
       return res.status(500).json({ authenticated: false, message: 'Failed to load session.' });
     });
+});
+
+app.get('/notifications/inventory-alerts', requireAuth, async (req, res) => {
+  try {
+    const userId = getSessionUserId(req);
+    const businessId = getSessionBusinessId(req);
+
+    if (!userId || !businessId) {
+      return res.status(400).json({ message: 'Business context is missing.' });
+    }
+
+    const [rows] = await db.execute(
+      `SELECT id, title, message, type, created_at
+       FROM notifications
+       WHERE user_id = ? AND business_id = ? AND type = 'INVENTORY_ALERT' AND is_read = 0
+       ORDER BY created_at DESC, id DESC`,
+      [userId, businessId]
+    );
+
+    return res.json(rows);
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to fetch notifications.' });
+  }
+});
+
+app.post('/notifications/inventory-alerts/read', requireAuth, async (req, res) => {
+  try {
+    const userId = getSessionUserId(req);
+    const businessId = getSessionBusinessId(req);
+
+    if (!userId || !businessId) {
+      return res.status(400).json({ message: 'Business context is missing.' });
+    }
+
+    await db.execute(
+      `UPDATE notifications
+       SET is_read = 1, read_at = CURRENT_TIMESTAMP
+       WHERE user_id = ? AND business_id = ? AND type = 'INVENTORY_ALERT' AND is_read = 0`,
+      [userId, businessId]
+    );
+
+    return res.json({ message: 'Notifications marked as read.' });
+  } catch (error) {
+    return res.status(500).json({ message: 'Failed to update notifications.' });
+  }
 });
 
 app.get('/roles', requireRole(['admin']), async (req, res) => {
